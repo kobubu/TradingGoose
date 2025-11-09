@@ -1,6 +1,10 @@
 import pandas as pd
 import numpy as np
-from core.data import load_ticker_history 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.data import load_ticker_history
 from core.forecast import train_select_and_forecast
 from datetime import datetime, timedelta
 
