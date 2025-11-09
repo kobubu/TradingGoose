@@ -17,7 +17,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff mypy pydocstyle
+          pip install ruff mypy pydocstyle pytest
+      
+      - name: Install package in development mode
+        run: pip install -e .
+      
       - name: Run tests
         run: pytest -q
       - name: Ruff lint
@@ -26,7 +30,3 @@ jobs:
         run: mypy . --install-types --non-interactive
       - name: Pydocstyle
         run: pydocstyle . || true  # don't fail build on docstyle at start
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest
