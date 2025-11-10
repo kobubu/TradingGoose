@@ -1,88 +1,64 @@
-# Telegram Stock Forecast Bot (Time Series Project)
+# Telegram Stock Forecast Bot (Проект по прогнозированию временных рядов)
 
-A machine learning-powered Telegram bot for stock price forecasting and time series analysis.
+Телеграм бот для прогнозирования цен акций с использованием машинного обучения и анализа временных рядов.
 
-## Features
+## 🚀 Возможности
 
-- **Stock Price Predictions** - Forecast future stock prices using ML models
-- **Technical Analysis** - Various indicators and analysis tools
-- **Multiple Timeframes** - Support for different time intervals
-- **Real-time Data** - Live market data integration
-- **User-friendly Interface** - Easy to use via Telegram commands
+- **Прогнозирование цен акций** - Предсказание будущих цен с помощью ML моделей
+- **Технический анализ** - Различные индикаторы и инструменты анализа
+- **Несколько таймфреймов** - Поддержка разных временных интервалов
+- **Данные в реальном времени** - Интеграция с биржевыми данными
+- **Удобный интерфейс** - Простое управление через Telegram команды
 
-## Installation
+## 📦 Установка
 
-1. Clone the repository:
+1. Клонируйте репозиторий:
 ```bash
 git clone https://github.com/kobubu/YourTradeBot.git
 cd YourTradeBot
-Install dependencies:
 
-bash
+2. Установите зависимости:
 pip install -r requirements.txt
-Set up environment variables:
 
-bash
+3. Настройте переменные окружения:
 cp .env.example .env
-# Edit .env with your API keys
-Run the bot:
+# Отредактируйте .env с вашими API ключами
 
-bash
+4. Запустите бота:
 python main.py
-Configuration
-Create a .env file with the following variables:
 
-text
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-ALPHA_VANTAGE_API_KEY=your_alpha_vantage_key
-DATABASE_URL=your_database_url
-Usage
-Start the bot and interact with it via Telegram:
+5. Конфигурация
+TELEGRAM_BOT_TOKEN=ваш_телеграм_токен
+# Добавьте другие API ключи по необходимости
 
-/start - Initialize the bot
+6. Использование
 
-/forecast <symbol> - Get stock forecast
+Запустите бота и взаимодействуйте через Telegram:
+/start - Инициализация бота
+/forecast <символ> - Получить прогноз по акции
+/analysis <символ> - Технический анализ
+/help - Показать доступные команды
+или управляйте кнопками
 
-/analysis <symbol> - Technical analysis
-
-/help - Show available commands
-
-Project Structure
-text
+7. Структура проекта
 telegram_stock_forecast_bot_CI_lint_cache/
-├── core/                 # Core bot functionality
-├── models/              # ML models for forecasting
-├── data/                # Data processing modules
-├── utils/               # Utility functions
-├── tests/               # Test suites
-├── logs/                # Application logs
-└── config/              # Configuration files
-Technologies Used
+├── core/                 # Основная функциональность бота
+├── models/              # ML модели для прогнозирования
+├── data/                # Модули обработки данных
+├── utils/               # Вспомогательные функции
+├── tests/               # Тесты
+├── logs/                # Логи приложения
+└── config/              # Файлы конфигурации
+
+8. Технологии
+
 Python 3.8+
-
 Telegram Bot API
+Машинное обучение (scikit-learn, TensorFlow/PyTorch)
+Pandas для анализа данных
+Библиотеки для анализа временных рядов
 
-Machine Learning (scikit-learn, TensorFlow/PyTorch)
+9. Лицензия
+MIT License - смотрите файл LICENSE для деталей
 
-Pandas for data analysis
-
-SQLAlchemy for database operations
-
-Alpha Vantage API for stock data
-
-Contributing
-Fork the repository
-
-Create a feature branch
-
-Commit your changes
-
-Push to the branch
-
-Create a Pull Request
-
-License
-MIT License - see LICENSE file for details
-
-Support
-For issues and questions, please open an Issue on GitHub.
+10. 
