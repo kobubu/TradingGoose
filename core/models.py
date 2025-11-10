@@ -1,3 +1,4 @@
+# models.py
 import json
 import os
 import warnings
@@ -309,14 +310,14 @@ def _wf_lstm(y: pd.Series, val_steps: int, window: int = 30,
 
     return preds_prices, (model, (last_mu, last_sigma), window, 'returns')
 
-def select_and_fit(
+def select_and_fit_with_candidates(
     y: pd.Series,
     val_steps: int = 30,
     horizon: int = WF_HORIZON,
     eval_tag: str = None,
     save_plots: bool = False,
     artifacts_dir: str = None
-) -> ModelResult:
+) -> Tuple[ModelResult, List[ModelResult]]:
     """Выбирает лучшую модель по RMSE на валидационном периоде"""
     if artifacts_dir is None:
         artifacts_dir = ART_DIR
@@ -476,7 +477,7 @@ def select_and_fit(
             os.path.join(artifacts_dir, f"{base}.json"),
         )
 
-    return best
+    return best, candidates
 
 def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
     """Переобучает лучшую модель на всех данных и строит 30-дневный прогноз"""
@@ -586,3 +587,18 @@ def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
 
     last = float(y.iloc[-1])
     return pd.Series([last]*30, index=range(1, 31))
+
+def select_and_fit(
+    y: pd.Series,
+    val_steps: int = 30,
+    horizon: int = WF_HORIZON,
+    eval_tag: str = None,
+    save_plots: bool = False,
+    artifacts_dir: str = None
+) -> ModelResult:
+    """Старая сигнатура для обратной совместимости."""
+    best, _ = select_and_fit_with_candidates(
+        y, val_steps=val_steps, horizon=horizon,
+        eval_tag=eval_tag, save_plots=save_plots, artifacts_dir=artifacts_dir
+    )
+    return best

@@ -5,8 +5,8 @@ MIN_PROFIT_USD = float(os.getenv('MIN_PROFIT_USD', '0.5'))
 MIN_PROFIT_PCT = float(os.getenv('MIN_PROFIT_PCT', '0.001'))
 RMSE_MULTIPLIER = float(os.getenv('RMSE_MULTIPLIER', '0.5'))
 
-UP_EMOJI = "📈"
-DOWN_EMOJI = "📉"
+UP_EMOJI = "🟢📈"
+DOWN_EMOJI = "🔴📉"
 
 def _local_extrema(series):
     """Находит локальные минимумы и максимумы в временном ряду"""
@@ -67,7 +67,9 @@ def generate_recommendations(fcst_df, capital_usd, model_rmse=None):
 
         profit += pnl
         lines.append(
-            f"Покупать {UP_EMOJI}: {buy.date()} @ {buy_price:.2f} → Продавать {DOWN_EMOJI}: {sell.date()} @ {sell_price:.2f} (доход ~ {pnl:.2f} USD)"
+            f"Покупать {DOWN_EMOJI}: {buy.date()} @ {buy_price:.2f} → "
+            f"Продавать {UP_EMOJI}: {sell.date()} @ {sell_price:.2f} "
+            f"(доход ~ {pnl:.2f} USD)"
         )
         markers.append({
             'buy': buy, 'sell': sell,
