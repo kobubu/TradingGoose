@@ -1,7 +1,7 @@
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Union
+from typing import Optional, Union, Dict, List
 
 import pandas as pd
 import yfinance as yf
@@ -11,9 +11,60 @@ CACHE_DAYS = int(os.getenv("CACHE_DAYS", "1"))
 ART_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "artifacts")
 DATA_SOURCE = os.getenv("DATA_SOURCE", "auto").lower()
 
+# -------------------- NEW: топ-10 криптовалют и маппинг на тикеры Yahoo --------------------
+# Берём монеты с устойчивыми тикерами в Yahoo Finance:
+# BTC-USD, ETH-USD, BNB-USD, SOL-USD, XRP-USD, ADA-USD, DOGE-USD, TRX-USD, AVAX-USD, LTC-USD
+CRYPTO_MAP: Dict[str, str] = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "BNB": "BNB-USD",
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD",
+    "ADA": "ADA-USD",
+    "DOGE": "DOGE-USD",
+    "TRX": "TRX-USD",
+    "AVAX": "AVAX-USD",
+    "LTC": "LTC-USD",
+}
+# Удобный порядок для кнопок в боте
+MAIN_CRYPTO: List[str] = list(CRYPTO_MAP.keys())
+# -------------------------------------------------------------------------------------------
+
+# -------------------- НОВОЕ: основные форекс-пары (Yahoo: '=X') --------------------
+# Символы для пользователя без суффиксов: EURUSD, GBPUSD, USDJPY и т.п.
+FOREX_MAP: Dict[str, str] = {
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X",
+    "USDCHF": "USDCHF=X",
+    "USDCAD": "USDCAD=X",
+    "AUDUSD": "AUDUSD=X",
+    "NZDUSD": "NZDUSD=X",
+    "EURGBP": "EURGBP=X",
+    "EURJPY": "EURJPY=X",
+    "GBPJPY": "GBPJPY=X",
+}
+MAIN_FOREX: List[str] = list(FOREX_MAP.keys())
+
 def _now_utc_date() -> datetime.date:
     """Возвращает текущую дату в UTC"""
     return datetime.utcnow().date()
+
+# -------------------- NEW: резолвер тикера от пользователя --------------------
+def resolve_user_ticker(user_ticker: str) -> str:
+    """
+    Принимает, к примеру, 'AAPL' / 'BTC' / 'EURUSD' и возвращает валидный тикер для загрузки.
+    - Крипта: BTC -> BTC-USD
+    - Форекс: EURUSD -> EURUSD=X
+    - Остальное: возвращаем как есть
+    """
+    t = (user_ticker or "").strip().upper()
+    if t in CRYPTO_MAP:
+        return CRYPTO_MAP[t]
+    if t in FOREX_MAP:
+        return FOREX_MAP[t]
+    return t
+# -------------------------------------------------------------------------------
 
 def _cache_read_if_fresh(ticker: str) -> Optional[pd.DataFrame]:
     """Пытается взять свежий кеш и вернуть DataFrame с колонкой Close"""
@@ -204,9 +255,14 @@ def _fetch_stooq_close(ticker: str) -> pd.DataFrame:
         raise ValueError(f"stooq: too few rows after cleaning: {len(df)}")
     return df
 
+
+
 def load_ticker_history(ticker: str, years: int = 2) -> Optional[pd.DataFrame]:
     """Основная функция загрузки исторических данных с кэшированием"""
     try:
+        # -------------------- NEW: резолвим юзерский тикер заранее --------------------
+        ticker = resolve_user_ticker(ticker)
+        # -----------------------------------------------------------------------------
         print(f"DEBUG: load_ticker_history(ticker={ticker}, years={years})")
         print(f"DEBUG: ART_DIR={ART_DIR}, CACHE_DAYS={CACHE_DAYS}, DATA_SOURCE={DATA_SOURCE}")
 
@@ -239,3 +295,26 @@ def load_ticker_history(ticker: str, years: int = 2) -> Optional[pd.DataFrame]:
     except Exception as e:
         print(f"DEBUG: exception in load_ticker_history: {e}")
         return None
+
+
+# -------------------- NEW: удобные врапперы для криптовалют --------------------
+def load_crypto_history(symbol: str, years: int = 2) -> Optional[pd.DataFrame]:
+    """
+    Загружает историю по крипте по символу из MAIN_CRYPTO (например, 'BTC').
+    """
+    yf_ticker = resolve_user_ticker(symbol)
+    return load_ticker_history(yf_ticker, years=years)
+
+def load_top_crypto_histories(years: int = 2) -> Dict[str, Optional[pd.DataFrame]]:
+    """
+    Пакетная загрузка по всем 10 основным криптовалютам.
+    Возвращает dict: {'BTC': df, 'ETH': df, ...}
+    """
+    out: Dict[str, Optional[pd.DataFrame]] = {}
+    for sym in MAIN_CRYPTO:
+        try:
+            out[sym] = load_crypto_history(sym, years=years)
+        except Exception:
+            out[sym] = None
+    return out
+# -------------------------------------------------------------------------------
