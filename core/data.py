@@ -136,10 +136,10 @@ def _ensure_close_frame(df: pd.DataFrame) -> pd.DataFrame:
                     close_col = col
                     break
     else:
-        if "Close" in df.columns:
-            close_col = "Close"
-        elif "Adj Close" in df.columns:
+        if "Adj Close" in df.columns:
             close_col = "Adj Close"
+        elif "Close" in df.columns:
+            close_col = "Close"
         else:
             for col in df.columns:
                 if "close" in str(col).lower():

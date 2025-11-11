@@ -12,7 +12,7 @@ import time
 import joblib
 from typing import Optional, Tuple, Dict, Any
 
-MODEL_ROOT = Path(__file__).resolve().parent / "artifacts" / "models"
+MODEL_ROOT = Path(__file__).resolve().parent.parent / "artifacts" / "models"
 MODEL_ROOT.mkdir(parents=True, exist_ok=True)
 
 def _hash_obj(obj) -> str:
@@ -63,27 +63,40 @@ def load_statsmodels_result(key: str) -> Tuple[Optional[object], Optional[Dict[s
 
 def save_tf_model(key: str, keras_model, meta: Dict[str, Any]):
     d = _model_dir_for_key(key)
-    model_dir = d / "tf_model"
-    if model_dir.exists():
+
+    # ✅ путь для новой модели
+    model_file = d / "tf_model.keras"
+
+    # удаляем старый SavedModel формата TF1.x, если был
+    old_dir = d / "tf_model"
+    if old_dir.exists():
         try:
             import shutil
-            shutil.rmtree(model_dir)
+            shutil.rmtree(old_dir)
         except Exception:
             pass
-    keras_model.save(str(model_dir))
+
+    # ✅ Сохраняем в правильном формате Keras 3
+    keras_model.save(str(model_file))
+
+    # ✅ Пишем метаданные
     with open(d / "meta.json", "w", encoding="utf8") as f:
         json.dump(meta, f, ensure_ascii=False)
 
+
 def load_tf_model(key: str) -> Tuple[Optional[object], Optional[Dict[str, Any]]]:
     d = MODEL_ROOT / key
-    model_dir = d / "tf_model"
+    model_file = d / "tf_model.keras"
     mmeta = d / "meta.json"
-    if not model_dir.exists() or not mmeta.exists():
+
+    if not model_file.exists() or not mmeta.exists():
         return None, None
+
     from tensorflow import keras
-    model = keras.models.load_model(str(model_dir))
+    model = keras.models.load_model(str(model_file))
     meta = json.load(open(mmeta, encoding="utf8"))
     return model, meta
+
 
 def remove_key(key: str):
     d = MODEL_ROOT / key
@@ -114,10 +127,10 @@ def purge_all(reason: str = "") -> int:
     return removed
 
 def purge_expired(ttl_seconds: int = None) -> int:
-    """Remove items whose meta['trained_at'] older than now-ttl_seconds."""
     if ttl_seconds is None:
         try:
-            ttl_seconds = int(os.getenv("CACHE_TTL_SECONDS", "86400"))
+            # читаем единый флаг
+            ttl_seconds = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
         except Exception:
             ttl_seconds = 86400
 
@@ -212,6 +225,7 @@ def save_forecasts(key: str,
                    fcst_avg_top3_df: pd.DataFrame,
                    meta: Dict[str, Any]) -> None:
     d = _model_dir_for_key(key)
+    print(f"[model_cache] save_forecasts -> {d}")
     # Индекс в CSV хранится как ISO8601
     fcst_best_df.to_csv(d / _F_BEST, index=True)
     fcst_avg_all_df.to_csv(d / _F_ALL, index=True)
@@ -221,6 +235,7 @@ def save_forecasts(key: str,
 
 def load_forecasts(key: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     d = _model_dir_for_key(key)
+    print(f"[model_cache] load_forecasts <- {d}")
     p_best = d / _F_BEST
     p_all  = d / _F_ALL
     p_top3 = d / _F_TOP3

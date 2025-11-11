@@ -21,10 +21,13 @@ MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 
 
 def _make_data_signature(df: pd.DataFrame) -> str:
-    last_ts = str(df.index[-1])
-    tail = df["Close"].tail(10).tolist()
-    payload = json.dumps({"last_ts": last_ts, "tail": tail}, default=str, sort_keys=True)
-    return hashlib.sha1(payload.encode()).hexdigest()
+    last_dt = pd.to_datetime(df.index[-1]).date().isoformat()
+    # Делаем сигнатуру устойчивее: убираем цену вовсе ИЛИ округляем грубо.
+    payload = {
+        "last_dt": last_dt,
+        "n": int(len(df)),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def _make_future_index(last_ts: pd.Timestamp, periods: int, ticker: str) -> pd.DatetimeIndex:
@@ -90,23 +93,32 @@ def train_select_and_forecast(
     val_steps = min(30, max(10, len(y) // 10))
     future_idx = _make_future_index(df.index[-1], 30, ticker or "")
 
-    # Готовим ключи кеша
+    # 1) ключи КЭША сначала
     data_sig = _make_data_signature(df)
     params = {"val_steps": val_steps, "disable_lstm": os.getenv("DISABLE_LSTM", "0") == "1"}
     model_key = model_cache.make_cache_key(ticker or "N/A", "auto", params, data_sig)
     fc_key = model_cache.make_forecasts_key(ticker or "N/A", data_sig)
 
-    # ---------- NEW: сначала пробуем достать 3 прогноза из кеша ----------
+    # 2) теперь безопасно логируем
+    try:
+        print(f"DEBUG: ticker={ticker}  len={len(df)}  last_dt={pd.to_datetime(df.index[-1]).date().isoformat()}")
+        print(f"DEBUG: model_key={model_key}")
+        print(f"DEBUG: fc_key={fc_key}")
+    except Exception:
+        pass
+
+    # ---------- сначала пробуем достать 3 прогноза из кеша ----------
     if ticker and not force_retrain:
         fb, fa, ft, fmeta = model_cache.load_forecasts(fc_key)
         if fb is not None and fa is not None and ft is not None and fmeta is not None:
             if _is_fresh(fmeta, MODEL_CACHE_TTL_SECONDS) and fmeta.get("data_sig") == data_sig:
+                print("DEBUG: forecasts cache HIT (fresh) → use saved 3x forecasts")
                 best_dict = {"name": fmeta.get("best_name", "cached_best")}
                 metrics = fmeta.get("metrics", {"rmse": None, "mape": None})
                 return best_dict, metrics, fb, fa, ft
+            # иначе просто пересчитаем и перезапишем
             else:
-                # не свежо — удалять файлы не обязательно, их перезапишем
-                pass
+                print("DEBUG: forecasts cache STALE → recompute & overwrite")
 
     # ---------- Далее старая логика: пытаемся использовать кэш модели для "best" ----------
     best_dict = {"name": None}
@@ -123,6 +135,7 @@ def train_select_and_forecast(
             "model_version": MODEL_VERSION,
             "data_sig": data_sig,
         }
+
         model_cache.save_forecasts(fc_key, fb, fa, ft, meta)
 
     # --- sklearn best
@@ -269,8 +282,9 @@ def train_select_and_forecast(
                     "data_sig": data_sig,
                 }
             )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ERR] save_forecasts failed: {e}")
+        raise
 
     print(f"DEBUG: trained from scratch. winner={best_dict['name']}, rmse={metrics['rmse']:.4f}")
     return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
