@@ -74,7 +74,7 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
     try:
         # резолвим тикер (например 'BTC' -> 'BTC-USD')
         resolved = resolve_user_ticker(ticker)
-        await reply_text_fn(f"Загружаю данные для {resolved} и считаю прогноз…")
+        await reply_text_fn(f"Загружаю данные для {resolved} и считаю прогноз. Может занять несколько минут…")
         df = load_ticker_history(resolved)
         if df is None or df.empty:
             await reply_text_fn("Не удалось загрузить данные. Проверьте тикер.", reply_markup=_category_keyboard())
@@ -243,6 +243,28 @@ async def tickers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Списки обновлены. Используйте /stocks (акции), /crypto (криптовалюты) и /forex (валютные пары).",
         reply_markup=_category_keyboard(),
     )
+async def _safe_reply_text(msg, text, **kwargs):
+    try:
+        await msg.reply_text(text, **kwargs)
+    except Forbidden:
+        pass
+
+async def _safe_reply_photo(msg, photo, caption=None, **kwargs):
+    try:
+        await msg.reply_photo(photo=photo, caption=caption, **kwargs)
+    except Forbidden:
+        pass
+
+async def error_handler(update, context):
+    err = context.error
+      # Пользователь/чат заблокировал бота — просто молча игнорируем
+    if isinstance(err, Forbidden):
+        return
+    # Иначе — выведем в консоль, чтобы не терять реальные ошибки
+    try:
+        print(f"[ERROR] {err}")
+    except Exception:
+        pass
 
 # --------------- Callback handler ---------------
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,6 +331,7 @@ def main():
     app.add_handler(CommandHandler("forex", forex))
     app.add_handler(CommandHandler("tickers", tickers))  # legacy
     app.add_handler(CallbackQueryHandler(_on_callback))
+    app.add_error_handler(error_handler)
     print("Bot is running…")
     app.run_polling()
 

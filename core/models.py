@@ -15,6 +15,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
 from statsmodels.tools.sm_exceptions import ConvergenceWarning, ValueWarning
 from tensorflow import keras
+from telegram.error import Forbidden
+
 
 # Затем предупреждения
 warnings.filterwarnings("ignore", category=ValueWarning)
@@ -602,3 +604,4 @@ def select_and_fit(
         eval_tag=eval_tag, save_plots=save_plots, artifacts_dir=artifacts_dir
     )
     return best
+

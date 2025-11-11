@@ -5,8 +5,8 @@ MIN_PROFIT_USD = float(os.getenv('MIN_PROFIT_USD', '0.5'))
 MIN_PROFIT_PCT = float(os.getenv('MIN_PROFIT_PCT', '0.001'))
 RMSE_MULTIPLIER = float(os.getenv('RMSE_MULTIPLIER', '0.5'))
 
-UP_EMOJI = "🟢📈"
-DOWN_EMOJI = "🔴📉"
+UP_EMOJI = "🔴📉"
+DOWN_EMOJI = "🟢📈"
 
 def _local_extrema(series):
     """Находит локальные минимумы и максимумы в временном ряду"""

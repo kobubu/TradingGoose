@@ -1,3 +1,4 @@
+"""data.py"""
 import os
 import time
 from datetime import datetime, timedelta
@@ -162,7 +163,11 @@ def _ensure_close_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_index()
 
     if len(out) < 90:
-        raise ValueError(f"Too few rows after cleaning: {len(out)} (<90)")
+   # оставим, но downstream пусть сам решит (val_steps=min(30, max(10, len//10)))
+        try:
+            print(f"DEBUG: short series: {len(out)} rows (<90), continuing anyway")
+        except Exception:
+            pass
     return out
 
 def _fetch_yahoo_clean(ticker: str, years: int = 2) -> pd.DataFrame:
