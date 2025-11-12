@@ -31,6 +31,9 @@ from core.subs import (
     pro_users_for_signal,
 )
 
+from core.reminders import init_reminders, add_reminder, count_active, due_for_day, mark_sent
+
+
 # ↓ опционально: тише лог TF (делай это до импортов tensorflow)
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -70,7 +73,7 @@ HELP_TEXT = (
     "/crypto — топ-10 криптовалют\n"
     "/forex — основные валютные пары\n"
     "/status — ваш тариф и лимиты\n"
-    "/pro — про подписку, /buy — оплата, /signal_on — включить сигналы\n\n"
+    "/pro — про подписку, /buy — оплата, /signal_on, signal_off — включить, выключить сигналы\n\n"
     "Бесплатно: 3 прогноза/день.\n"
     "Pro (1 TON/мес): 10 прогнозов/день + ежедневный «Signal Mode».\n\n"
     "⚠️ Не является инвестсоветом."
@@ -133,23 +136,25 @@ def _fmt_until(ts: int):
 
 # --------------- Forecast pipeline ---------------
 async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_photo_fn, user_id=None):
+    """
+    Строит 3 прогноза (best/top3/all), отправляет 3 картинки + тексты.
+    Кнопка «🔔 Напомнить … 09:00 МСК» показывается только если есть чёткие сигналы
+    (т.е. _pick_reminder_date вернула дату; иначе — кнопки нет).
+    """
     try:
+        # 1) резолвим тикер и грузим историю
         resolved = resolve_user_ticker(ticker)
         await reply_text_fn(f"Загружаю данные для {resolved} и считаю прогноз. Может занять несколько минут…")
+
         df = load_ticker_history(resolved)
         if df is None or df.empty:
             await reply_text_fn("Не удалось загрузить данные. Проверьте тикер.", reply_markup=_category_keyboard())
             return
-        if user_id is not None:
-            try:
-                consume_one(user_id)
-            except Exception:
-                pass        
 
-        # три прогноза
+        # 2) три прогноза
         best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df = train_select_and_forecast(df, ticker=resolved)
 
-        # рекомендации
+        # 3) рекомендации
         rec_best,  profit_best,  markers_best  = generate_recommendations(
             fcst_best_df, amount, model_rmse=metrics.get('rmse') if metrics else None
         )
@@ -160,12 +165,12 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
             fcst_avg_top3_df, amount, model_rmse=metrics.get('rmse') if metrics else None
         )
 
-        # 3 картинки
+        # 4) картинки
         img_best = make_plot_image(df, fcst_best_df,     resolved, markers=markers_best,  title_suffix="(Лучшая модель)")
         img_t3   = make_plot_image(df, fcst_avg_top3_df, resolved, markers=markers_top3, title_suffix="(Ансамбль топ-3)")
         img_all  = make_plot_image(df, fcst_avg_all_df,  resolved, markers=markers_all,  title_suffix="(Ансамбль всех)")
 
-        # 3 PDF-артефакта (опционально)
+        # 5) (опционально) PDF
         try:
             from datetime import datetime as _dt
             art_dir = os.path.join(os.path.dirname(__file__), "artifacts")
@@ -177,13 +182,13 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
         except Exception:
             pass
 
-        # дельты к последнему Close
+        # 6) дельты
         last_close = float(df['Close'].iloc[-1])
         delta_best = ((fcst_best_df['forecast'].iloc[-1]     - last_close) / last_close) * 100.0
         delta_t3   = ((fcst_avg_top3_df['forecast'].iloc[-1] - last_close) / last_close) * 100.0
         delta_all  = ((fcst_avg_all_df['forecast'].iloc[-1]  - last_close) / last_close) * 100.0
 
-        # подписи
+        # 7) подписи
         cap_best = (
             f"Тикер: {resolved}\n"
             f"Лучшая модель: {best['name']} (RMSE={metrics['rmse']:.2f})\n"
@@ -209,33 +214,51 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
             "⚠️ Не является инвестсоветом."
         )
 
-        # отправка 3 изображений
+        # 8) даты для «Напомнить…» — только если есть маркеры (иначе None)
+        date_best = _pick_reminder_date(markers_best,  fcst_best_df)
+        date_t3   = _pick_reminder_date(markers_top3, fcst_avg_top3_df)
+        date_all  = _pick_reminder_date(markers_all,  fcst_avg_all_df)
+
+        # Клавиатуры «Напомнить» — только если есть реальные маркеры
+        kb_best = _reminders_keyboard_from_markers(resolved, "best", markers_best)
+        kb_t3   = _reminders_keyboard_from_markers(resolved, "top3", markers_top3)
+        kb_all  = _reminders_keyboard_from_markers(resolved, "all",  markers_all)
+
+        # 1/3 best
         if len(cap_best) <= CAPTION_MAX:
-            await reply_photo_fn(photo=img_best, caption=cap_best)
+            await reply_photo_fn(photo=img_best, caption=cap_best, reply_markup=kb_best) if kb_best \
+                else await reply_photo_fn(photo=img_best, caption=cap_best)
         else:
-            await reply_photo_fn(photo=img_best)
+            await reply_photo_fn(photo=img_best, reply_markup=kb_best) if kb_best \
+                else await reply_photo_fn(photo=img_best)
             for i in range(0, len(cap_best), TEXT_MAX):
                 await reply_text_fn(cap_best[i:i + TEXT_MAX])
 
+        # 2/3 top3
         if len(cap_t3) <= CAPTION_MAX:
-            await reply_photo_fn(photo=img_t3, caption=cap_t3)
+            await reply_photo_fn(photo=img_t3, caption=cap_t3, reply_markup=kb_t3) if kb_t3 \
+                else await reply_photo_fn(photo=img_t3, caption=cap_t3)
         else:
-            await reply_photo_fn(photo=img_t3)
+            await reply_photo_fn(photo=img_t3, reply_markup=kb_t3) if kb_t3 \
+                else await reply_photo_fn(photo=img_t3)
             for i in range(0, len(cap_t3), TEXT_MAX):
                 await reply_text_fn(cap_t3[i:i + TEXT_MAX])
 
+        # 3/3 all
         if len(cap_all) <= CAPTION_MAX:
-            await reply_photo_fn(photo=img_all, caption=cap_all)
+            await reply_photo_fn(photo=img_all, caption=cap_all, reply_markup=kb_all) if kb_all \
+                else await reply_photo_fn(photo=img_all, caption=cap_all)
         else:
-            await reply_photo_fn(photo=img_all)
+            await reply_photo_fn(photo=img_all, reply_markup=kb_all) if kb_all \
+                else await reply_photo_fn(photo=img_all)
             for i in range(0, len(cap_all), TEXT_MAX):
                 await reply_text_fn(cap_all[i:i + TEXT_MAX])
 
-        # меню
-        await reply_text_fn("📋 Главное меню:", reply_markup=_main_menu_keyboard())
 
+        # 10) меню
+        await reply_text_fn("Быстрый выбор категории:", reply_markup=_category_keyboard())
 
-        # лог (по лучшей модели)
+        # 11) лог (по лучшей модели)
         log_request(
             user_id=user_id,
             ticker=resolved,
@@ -246,12 +269,12 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
             est_profit=profit_best,
         )
 
-        # мягкий upsell (если юзер не Pro)
+        # 12) мягкий upsell (если не Pro)
         try:
             if user_id:
                 st = get_status(user_id)
                 remaining = max(0, get_limits(user_id) - st["daily_count"])
-                if st["tier"] != "pro":
+                if st.get("tier") != "pro":
                     tip = (
                         f"Сегодня осталось прогнозов: {remaining}. "
                         f"Проапгрейд до Pro (1 TON/мес) — 10/день + ежедневные сигналы. "
@@ -265,6 +288,7 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
         await reply_text_fn(f"Ошибка: {e}", reply_markup=_category_keyboard())
 
 
+
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     await msg.reply_text("📋 Главное меню:", reply_markup=_main_menu_keyboard())
@@ -274,6 +298,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     await msg.reply_text(HELP_TEXT, reply_markup=_category_keyboard())
     await msg.reply_text("Полезное:", reply_markup=_pro_cta_keyboard())
+
+def _reminder_keyboard(ticker: str, variant: str, schedule_date) -> InlineKeyboardMarkup:
+    # schedule_date — это date/datetime
+    date_iso = schedule_date.strftime("%Y-%m-%d")
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"🔔 Напомнить {date_iso} в 09:00 МСК",
+                             callback_data=f"remind:{ticker}:{variant}:{date_iso}")
+    ]])
+
+def _pick_reminder_date(markers, fcst_df):
+    # markers: [{'buy': pd.Timestamp, ...}, ...]
+    try:
+        if markers and markers[0].get('buy'):
+            return markers[0]['buy'].to_pydatetime().date()
+    except Exception:
+        pass
+    # иначе первая дата прогноза
+    return None
+
+def _reminders_keyboard_from_markers(ticker: str, variant: str, markers, max_buttons: int = 6):
+    """
+    Делает по кнопке на каждую рекомендацию (по buy-дате).
+    Формат callback: rmd:<ticker>:<variant>:<YYYY-MM-DD>
+    Показываем не больше max_buttons (чтобы не раздувать сообщение).
+    """
+    rows = []
+    cnt = 0
+    for m in (markers or []):
+        try:
+            d = m.get("buy")
+            if not d:
+                continue
+            d_iso = d.to_pydatetime().date().strftime("%Y-%m-%d")
+            rows.append([InlineKeyboardButton(
+                f"🔔 Напомнить {d_iso} в 09:00 МСК",
+                callback_data=f"rmd:{ticker}:{variant}:{d_iso}"
+            )])
+            cnt += 1
+            if cnt >= max_buttons:
+                break
+        except Exception:
+            continue
+    return InlineKeyboardMarkup(rows) if rows else None
+
 
 async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -362,8 +430,8 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def reply_text(text, **kwargs):
             await query.message.reply_text(text, **kwargs)
 
-        async def reply_photo(photo, caption=None):
-            await query.message.reply_photo(photo=photo, caption=caption)
+        async def reply_photo(photo, caption=None, **kwargs):
+            await query.message.reply_photo(photo=photo, caption=caption, **kwargs)
 
         user_id = query.from_user.id if query.from_user else None
         
@@ -415,7 +483,49 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kind == "help":
             await query.message.reply_text(HELP_TEXT, reply_markup=_main_menu_keyboard())
             return
+    
+    if data.startswith("rmd:") or data.startswith("remind:"):
+        # форматы:
+        # rmd:<ticker>:<variant>:<YYYY-MM-DD>
+        # remind:<ticker>:<variant>:<YYYY-MM-DD>  (legacy)
+        parts = data.split(":")
+        if len(parts) != 4:
+            await query.message.reply_text("Неверный формат напоминания.")
+            return
+        _, ticker, variant, date_iso = parts
 
+        user_id = query.from_user.id if query.from_user else None
+        if not user_id:
+            await query.message.reply_text("Не удалось определить пользователя.")
+            return
+
+        st = get_status(user_id)
+        active = count_active(user_id)
+        limit = 100 if st.get("tier") == "pro" else 1
+        if active >= limit:
+            await query.message.reply_text(
+                f"Достигнут лимит активных напоминаний ({active}/{limit}). "
+                f"Очистите старые (они автоматически исчезают после отправки) или оформите Pro.",
+                reply_markup=_pro_cta_keyboard()
+            )
+            return
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        try:
+            dt_local = datetime.strptime(date_iso, "%Y-%m-%d").replace(hour=9, minute=0, second=0, microsecond=0)
+            dt_msk = dt_local.replace(tzinfo=ZoneInfo("Europe/Moscow"))
+            when_ts = int(dt_msk.timestamp())
+        except Exception:
+            await query.message.reply_text("Не удалось распознать дату для напоминания.")
+            return
+
+        add_reminder(user_id, ticker, variant, when_ts)
+        await query.message.reply_text(
+            f"Готово! Напомню про {ticker} ({'Лучшая' if variant=='best' else 'Топ-3' if variant=='top3' else 'Все'}) "
+            f"{date_iso} в 09:00 (МСК)."
+        )
+        return
 # --------------- Pro / Billing / Signals ---------------
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -535,9 +645,87 @@ async def daily_signals(app):
         except Exception:
             continue
 
+async def _send_single_variant(app, user_id: int, ticker: str, variant: str):
+    """Пересчитывает прогноз по тикеру и отправляет ОДИН вариант: best/top3/all."""
+    resolved = resolve_user_ticker(ticker)
+    df = load_ticker_history(resolved)
+    if df is None or df.empty:
+        await app.bot.send_message(chat_id=user_id, text=f"Напоминание по {resolved}: не удалось загрузить данные.")
+        return
+
+    best, metrics, fb, fa, ft = train_select_and_forecast(df, ticker=resolved)
+
+    # выбираем набор
+    if variant == "best":
+        fcst_df = fb
+        rec_txt, profit, markers = generate_recommendations(fb, DEFAULT_AMOUNT, model_rmse=metrics.get('rmse') if metrics else None)
+        img = make_plot_image(df, fb, resolved, markers=markers, title_suffix="(Напоминание • Лучшая модель)")
+        delta = (fb['forecast'].iloc[-1] - float(df['Close'].iloc[-1])) / float(df['Close'].iloc[-1]) * 100.0
+        cap = (
+            f"🔔 Напоминание\nТикер: {resolved}\n"
+            f"Лучшая модель: {best['name']} (RMSE={metrics['rmse']:.2f})\n"
+            f"Изменение цены (30д): {delta:+.2f}%\n\n"
+            f"{rec_txt}\n\n"
+            "⚠️ Не является инвестсоветом."
+        )
+    elif variant == "top3":
+        fcst_df = ft
+        rec_txt, profit, markers = generate_recommendations(ft, DEFAULT_AMOUNT, model_rmse=metrics.get('rmse') if metrics else None)
+        img = make_plot_image(df, ft, resolved, markers=markers, title_suffix="(Напоминание • Ансамбль топ-3)")
+        delta = (ft['forecast'].iloc[-1] - float(df['Close'].iloc[-1])) / float(df['Close'].iloc[-1]) * 100.0
+        cap = (
+            f"🔔 Напоминание\nТикер: {resolved}\n"
+            f"Ансамбль: среднее по топ-3 моделям\n"
+            f"Изменение цены (30д): {delta:+.2f}%\n\n"
+            f"{rec_txt}\n\n"
+            "⚠️ Не является инвестсоветом."
+        )
+    else:
+        fcst_df = fa
+        rec_txt, profit, markers = generate_recommendations(fa, DEFAULT_AMOUNT, model_rmse=metrics.get('rmse') if metrics else None)
+        img = make_plot_image(df, fa, resolved, markers=markers, title_suffix="(Напоминание • Ансамбль всех)")
+        delta = (fa['forecast'].iloc[-1] - float(df['Close'].iloc[-1])) / float(df['Close'].iloc[-1]) * 100.0
+        cap = (
+            f"🔔 Напоминание\nТикер: {resolved}\n"
+            f"Ансамбль: среднее по всем моделям\n"
+            f"Изменение цены (30д): {delta:+.2f}%\n\n"
+            f"{rec_txt}\n\n"
+            "⚠️ Не является инвестсоветом."
+        )
+
+    await app.bot.send_photo(chat_id=user_id, photo=img, caption=cap[:1024])
+
+
 async def daily_signals_job(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
     await daily_signals(app)
+    
+async def reminders_job(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляем напоминания, запланированные на сегодня 09:00 МСК."""
+    app = context.application
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    day_start = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    send_start = day_start.replace(hour=9)          # 09:00 МСК
+    send_end = send_start + timedelta(hours=1)      # окно 1 час на всякий случай
+
+    day_start_ts = int(send_start.timestamp())
+    day_end_ts = int(send_end.timestamp())
+
+    due = due_for_day(day_start_ts, day_end_ts)
+    if not due:
+        return
+
+    for rem_id, user_id, ticker, variant, when_ts in due:
+        try:
+            # отправляем ОДИН выбранный вариант прогноза (без списания лимитов)
+            await _send_single_variant(app, user_id, ticker, variant)
+            mark_sent(rem_id)
+        except Exception:
+            # не падаем из-за одного пользователя
+            continue
 
 # --------------- Entrypoint ---------------
 def main():
@@ -545,6 +733,7 @@ def main():
         raise RuntimeError("Please set TELEGRAM_BOT_TOKEN in .env")
 
     init_db()  # БД подписок
+    init_reminders()  # БД напоминалок
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # хендлеры
@@ -565,12 +754,18 @@ def main():
     app.add_error_handler(error_handler)
 
 
-    # ежедневные «сигналы» через JobQueue (09:00 по Хельсинки)
+    # ежедневные «сигналы» через JobQueue (09:00 по МСК)
     app.job_queue.run_daily(
         daily_signals_job,
         time=dtime(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
         name="daily_signals",
     )
+    # ежедневные «напоминания» через JobQueue (09:00 по МСК)
+    app.job_queue.run_daily(
+    reminders_job,
+    time=dtime(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
+    name="reminders",
+)
 
     print("Bot is running…")
     app.run_polling()
