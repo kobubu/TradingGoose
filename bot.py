@@ -20,15 +20,9 @@ from core.forecast import export_plot_pdf, make_plot_image, train_select_and_for
 from core.logging_utils import log_request
 from core.recommend import generate_recommendations
 from core.subs import (
-    init_db,
-    get_status,
-    set_signal,
-    is_pro,
-    get_limits,
-    can_consume,
-    consume_one,
-    set_tier,
-    pro_users_for_signal,
+    init_db, get_status, set_signal, is_pro, get_limits, can_consume, consume_one,
+    set_tier, pro_users_for_signal,
+    set_signal_cats, get_signal_cats, set_signal_list, get_signal_list
 )
 
 from core.reminders import init_reminders, add_reminder, count_active, due_for_day, mark_sent
@@ -117,6 +111,54 @@ def _pro_cta_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("ℹ️ Статус", callback_data="menu:status"),
         ]]
     )
+
+async def signal_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_pro(u.id):
+        await update.effective_message.reply_text("Опция доступна только Pro. /pro")
+        return
+    set_signal_cats(u.id, "all")
+    await update.effective_message.reply_text("Signal Mode: все категории (акции+крипта+форекс) ✅")
+
+async def signal_stocks_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_pro(u.id):
+        await update.effective_message.reply_text("Опция доступна только Pro. /pro")
+        return
+    set_signal_cats(u.id, "stocks")
+    await update.effective_message.reply_text("Signal Mode: только акции ✅")
+
+async def signal_crypto_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_pro(u.id):
+        await update.effective_message.reply_text("Опция доступна только Pro. /pro")
+        return
+    set_signal_cats(u.id, "crypto")
+    await update.effective_message.reply_text("Signal Mode: только крипта ✅")
+
+async def signal_forex_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_pro(u.id):
+        await update.effective_message.reply_text("Опция доступна только Pro. /pro")
+        return
+    set_signal_cats(u.id, "forex")
+    await update.effective_message.reply_text("Signal Mode: только форекс ✅")
+
+async def signal_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /signal_custom AAPL,MSFT,BTC,EURUSD
+    """
+    u = update.effective_user
+    if not is_pro(u.id):
+        await update.effective_message.reply_text("Опция доступна только Pro. /pro")
+        return
+    args = " ".join(context.args).strip()
+    if not args:
+        await update.effective_message.reply_text("Использование: /signal_custom <тикеры через запятую>")
+        return
+    set_signal_cats(u.id, "custom")
+    set_signal_list(u.id, args)
+    await update.effective_message.reply_text(f"Signal Mode: выбранные тикеры ✅\nСписок: {args}")
 
 def _build_list_rows(items, per_row=3):
     rows, row = [], []
@@ -297,7 +339,20 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     await msg.reply_text(HELP_TEXT, reply_markup=_category_keyboard())
-    await msg.reply_text("Полезное:", reply_markup=_pro_cta_keyboard())
+    await msg.reply_text(
+    "Полезное:\n"
+    "💎 /pro — про подписку и Signal Mode\n"
+    "💳 /buy — как оплатить\n"
+    "📡 /signal_on — включить сигналы (Pro)\n"
+    "🛰 /signal_all — все категории\n"
+    "📈 /signal_stocks_only — только акции\n"
+    "₿ /signal_crypto_only — только крипта\n"
+    "💱 /signal_forex_only — только форекс\n"
+    "🎯 /signal_custom <тикеры> — свои тикеры\n\n"
+    "💬 /status — ваш тариф, лимиты и напоминания",
+    reply_markup=_pro_cta_keyboard()
+)
+
 
 def _reminder_keyboard(ticker: str, variant: str, schedule_date) -> InlineKeyboardMarkup:
     # schedule_date — это date/datetime
@@ -531,14 +586,38 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     u = update.effective_user
     st = get_status(u.id)
+
+    # напоминания: считаем активные и лимит по тарифу
+    try:
+        active_rmd = count_active(u.id)
+    except Exception:
+        active_rmd = 0
+    rmd_limit = 100 if st.get("tier") == "pro" else 1
+
+    mode = get_signal_cats(u.id)
+    lst  = get_signal_list(u.id)
+    mode_h = {
+        "all": "все категории",
+        "stocks": "только акции",
+        "crypto": "только крипта",
+        "forex": "только форекс",
+        "custom": "выбранные тикеры",
+    }.get(mode, mode)
+
+    extra = f"\nSignal режим: {mode_h}"
+    if mode == "custom":
+        extra += f" ({', '.join(lst) if lst else 'не задано'})"
+
     cap = (
         f"Статус: {('PRO' if st['tier']=='pro' else 'FREE')}\n"
         f"Лимит/день: {get_limits(u.id)}\n"
         f"Израсходовано сегодня: {st['daily_count']}\n"
         f"Подписка до: {_fmt_until(st['sub_until'])}\n"
-        f"Signal Mode: {'ON' if st['signal_enabled'] else 'OFF'}"
-    )
+        f"Signal Mode: {'ON' if st['signal_enabled'] else 'OFF'}{extra}\n"
+        f"Активных напоминаний: {active_rmd} / {rmd_limit}"
+)
     await msg.reply_text(cap, reply_markup=_category_keyboard())
+
 
 async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -546,12 +625,23 @@ async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💎 *Pro-подписка*\n"
         "Стоимость: 1 TON / месяц\n\n"
         "Преимущества:\n"
-        "• до 10 прогнозов в день (вместо 3)\n"
-        "• автоматический *Signal Mode* — бот присылает лучший прогноз дня (акции / крипта / форекс)\n\n"
+        "• до *10 прогнозов в день* (вместо 3)\n"
+        "• *Signal Mode* — бот сам присылает лучшие прогнозы в 09:00 МСК\n"
+        "• поддержка напоминаний и расширенных функций\n\n"
+        "📡 Режимы Signal Mode:\n"
+        "• /signal_all — все категории (акции, крипта, форекс)\n"
+        "• /signal_stocks_only — только акции\n"
+        "• /signal_crypto_only — только крипта\n"
+        "• /signal_forex_only — только форекс\n"
+        "• /signal_custom AAPL,MSFT,BTC,EURUSD — свои тикеры\n\n"
+        "⚙️ Управление:\n"
+        "• /signal_on — включить рассылку\n"
+        "• /signal_off — выключить\n\n"
         "Для оплаты используйте команду /buy\n"
         "После активации — включите сигналы: /signal_on"
     )
     await msg.reply_text(txt, parse_mode="Markdown", reply_markup=_category_keyboard())
+
 
 async def signal_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -614,36 +704,67 @@ async def daily_signals(app):
     if not users:
         return
 
-    # считаем один раз на всех
-    best_stocks = await _best_of_category(SUPPORTED_STOCKS, "stocks", app)
-    best_crypto = await _best_of_category(SUPPORTED_CRYPTO, "crypto", app)
-    best_fx     = await _best_of_category(SUPPORTED_FOREX, "forex", app)
+    # Чтобы не считать по 100 раз одно и то же, сделаем кэш результатов по категориям/спискам:
+    cached_best = {}  # ключ -> dict(...)
+
+    async def best_for_key(key, tickers):
+        # key: str ('stocks'|'crypto'|'forex'|'custom:<csv>')
+        if key in cached_best:
+            return cached_best[key]
+        # считаем лучший из набора tickers
+        best = await _best_of_category(tickers, key, app)
+        cached_best[key] = best
+        return best
 
     for uid in users:
         try:
             st = get_status(uid)
             if not st["signal_enabled"]:
                 continue
-            intro = "Дневной сигнал: лучшие возможности по категориям\n(оценка по потенциальной прибыли на $1,000)\n\n"
+
+            mode = get_signal_cats(uid)  # 'all'|'stocks'|'crypto'|'forex'|'custom'
+            custom_list = get_signal_list(uid) if mode == "custom" else []
+
+            intro = "Дневной сигнал (оценка прибыли на $1,000):\n"
             await app.bot.send_message(chat_id=uid, text=intro)
 
-            async def send_best(item, cat_name):
-                if not item or item["profit"] <= 0:
-                    await app.bot.send_message(chat_id=uid, text=f"{cat_name}: на сегодня сильных сигналов нет.")
+            async def send_item(best, label):
+                if not best or best["profit"] <= 0:
+                    await app.bot.send_message(chat_id=uid, text=f"{label}: сильных сигналов нет.")
                     return
-                img = make_plot_image(item["df"], item["fcst"], item["ticker"], title_suffix=f"(Сигнал {cat_name})")
-                cap = (f"{cat_name}: {item['ticker']}\n"
-                       f"Модель: {item['best_name']} (RMSE={item['metrics'].get('rmse') if item['metrics'] else '—'})\n"
-                       f"Оценка прибыли (на $1,000): ~ {item['profit']:.2f} USD\n\n"
-                       f"{item['rec']}\n\n"
+                img = make_plot_image(best["df"], best["fcst"], best["ticker"], title_suffix=f"(Сигнал {label})")
+                metrics = best.get("metrics") or {}
+                rmse_str = f"{metrics.get('rmse'):.2f}" if metrics.get('rmse') is not None else "—"
+                cap = (f"{label}: {best['ticker']}\n"
+                       f"Модель: {best['best_name']} (RMSE={rmse_str})\n"
+                       f"Оценка прибыли: ~ {best['profit']:.2f} USD\n\n"
+                       f"{best['rec']}\n\n"
                        "⚠️ Не является инвестсоветом.")
                 await app.bot.send_photo(chat_id=uid, photo=img, caption=cap[:1024])
 
-            await send_best(best_stocks, "Акции")
-            await send_best(best_crypto, "Крипта")
-            await send_best(best_fx,     "Форекс")
+            if mode == "all":
+                await send_item(await best_for_key("stocks", SUPPORTED_STOCKS), "Акции")
+                await send_item(await best_for_key("crypto", SUPPORTED_CRYPTO), "Крипта")
+                await send_item(await best_for_key("forex",  SUPPORTED_FOREX),  "Форекс")
+            elif mode == "stocks":
+                await send_item(await best_for_key("stocks", SUPPORTED_STOCKS), "Акции")
+            elif mode == "crypto":
+                await send_item(await best_for_key("crypto", SUPPORTED_CRYPTO), "Крипта")
+            elif mode == "forex":
+                await send_item(await best_for_key("forex",  SUPPORTED_FOREX),  "Форекс")
+            elif mode == "custom":
+                # сохраним ключ для кэша, чтобы у разных пользователей с одним списком не дублировать
+                key = "custom:" + ",".join(custom_list)
+                await send_item(await best_for_key(key, custom_list), "Выбранные тикеры")
+            else:
+                # fallback: all
+                await send_item(await best_for_key("stocks", SUPPORTED_STOCKS), "Акции")
+                await send_item(await best_for_key("crypto", SUPPORTED_CRYPTO), "Крипта")
+                await send_item(await best_for_key("forex",  SUPPORTED_FOREX),  "Форекс")
+
         except Exception:
             continue
+
 
 async def _send_single_variant(app, user_id: int, ticker: str, variant: str):
     """Пересчитывает прогноз по тикеру и отправляет ОДИН вариант: best/top3/all."""
@@ -751,6 +872,11 @@ def main():
     app.add_handler(CommandHandler("redeem", redeem_cmd))
     app.add_handler(CallbackQueryHandler(_on_callback))
     app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("signal_all", signal_all))
+    app.add_handler(CommandHandler("signal_stocks_only", signal_stocks_only))
+    app.add_handler(CommandHandler("signal_crypto_only", signal_crypto_only))
+    app.add_handler(CommandHandler("signal_forex_only", signal_forex_only))
+    app.add_handler(CommandHandler("signal_custom", signal_custom))
     app.add_error_handler(error_handler)
 
 
