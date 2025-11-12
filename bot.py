@@ -77,6 +77,26 @@ HELP_TEXT = (
 )
 
 # ---------------- UI helpers ----------------
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Главное меню — категории + навигация."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📈 Акции", callback_data="menu:stocks"),
+            InlineKeyboardButton("₿ Крипта", callback_data="menu:crypto"),
+            InlineKeyboardButton("💱 Форекс", callback_data="menu:forex"),
+        ],
+        [
+            InlineKeyboardButton("💎 Pro", callback_data="menu:pro"),
+            InlineKeyboardButton("💳 Купить", callback_data="menu:buy"),
+            InlineKeyboardButton("ℹ️ Статус", callback_data="menu:status"),
+        ],
+        [
+            InlineKeyboardButton("❓ Все команды", callback_data="menu:help")
+        ]
+    ])
+
+
 def _category_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[
@@ -212,7 +232,8 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
                 await reply_text_fn(cap_all[i:i + TEXT_MAX])
 
         # меню
-        await reply_text_fn("Быстрый выбор категории:", reply_markup=_category_keyboard())
+        await reply_text_fn("📋 Главное меню:", reply_markup=_main_menu_keyboard())
+
 
         # лог (по лучшей модели)
         log_request(
@@ -242,6 +263,11 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
 
     except Exception as e:
         await reply_text_fn(f"Ошибка: {e}", reply_markup=_category_keyboard())
+
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    await msg.reply_text("📋 Главное меню:", reply_markup=_main_menu_keyboard())
 
 # --------------- Command handlers ---------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,6 +411,9 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if kind == "status":
             await status_cmd(update, context)
+            return
+        if kind == "help":
+            await query.message.reply_text(HELP_TEXT, reply_markup=_main_menu_keyboard())
             return
 
 # --------------- Pro / Billing / Signals ---------------
@@ -532,12 +561,14 @@ def main():
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("redeem", redeem_cmd))
     app.add_handler(CallbackQueryHandler(_on_callback))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_error_handler(error_handler)
+
 
     # ежедневные «сигналы» через JobQueue (09:00 по Хельсинки)
     app.job_queue.run_daily(
         daily_signals_job,
-        time=dtime(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Helsinki")),
+        time=dtime(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
         name="daily_signals",
     )
 
