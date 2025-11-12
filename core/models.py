@@ -14,6 +14,7 @@ import tensorflow as tf
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
 from statsmodels.tools.sm_exceptions import ConvergenceWarning, ValueWarning
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  
 from tensorflow import keras
 from telegram.error import Forbidden
 
