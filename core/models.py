@@ -37,6 +37,15 @@ matplotlib.use("Agg")
 
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 DISABLE_LSTM = os.getenv('DISABLE_LSTM', '0') == '1'
+DISABLE_NBEATS = os.getenv('DISABLE_NBEATS', '0') == '1' 
+
+
+# NBEATS hyperparams из .env
+NBEATS_BLOCKS = int(os.getenv("NBEATS_BLOCKS", "3"))
+NBEATS_WIDTH = int(os.getenv("NBEATS_WIDTH", "128"))
+NBEATS_HIDDEN = int(os.getenv("NBEATS_HIDDEN", "4"))
+NBEATS_EPOCHS = int(os.getenv("NBEATS_EPOCHS", "10"))
+NBEATS_BATCH = int(os.getenv("NBEATS_BATCH", "32"))
 
 ART_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "artifacts")
 os.makedirs(ART_DIR, exist_ok=True)
@@ -477,6 +486,33 @@ def select_and_fit_with_candidates(
         if best_lstm is not None:
             candidates.append(best_lstm)
 
+     # N-BEATS (если не отключён)
+    if not DISABLE_NBEATS:
+        best_nbeats: Optional[ModelResult] = None
+        for win in (60, 90, 120):
+            try:
+                nbeats_preds, nbeats_obj = _wf_nbeats(
+                    y,
+                    val_steps=val_steps,
+                    window=win,
+                    horizon=horizon,
+                )
+                if _valid_preds(nbeats_preds, val_steps):
+                    rmse = mean_squared_error(y_true, nbeats_preds, squared=False)
+                    cand = ModelResult(
+                        name=f"NBEATS(window={win})",
+                        yhat_val=nbeats_preds,
+                        rmse=float(rmse),
+                        model_obj=nbeats_obj,  # (window, horizon, blocks, width, hidden)
+                        extra={"type": "nbeats", "window": win},
+                    )
+                    logger.debug("NBEATS candidate window=%d rmse=%.4f", win, rmse)
+                    ...
+            except Exception:
+                logger.exception("NBEATS candidate failed for window=%d", win)
+        if best_nbeats is not None:
+            candidates.append(best_nbeats)
+
     try:
         logger.info(
             "Model candidates: %s",
@@ -633,6 +669,71 @@ def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
             preds_denorm = (np.array(preds) * sigma + mu).reshape(-1)
             return pd.Series(preds_denorm, index=range(1, 31))
 
+    elif best.extra.get("type") == "nbeats":
+        # best.model_obj: (window, horizon_trained, n_blocks, width, n_hidden)
+        window, horizon_trained, n_blocks, width, n_hidden = best.model_obj
+        arr = y.values.astype(float)
+
+        if len(arr) <= window + 10:
+            logger.warning("NBEATS refit: too few samples; returning flat series")
+            last = float(arr[-1])
+            return pd.Series([last] * 30, index=range(1, 31))
+
+        # готовим train dataset для horizon=1 (будем шагать авто-регрессией на 30 дней)
+        horizon_fc = 1
+        X, yy = [], []
+        for t in range(window, len(arr) - horizon_fc + 1):
+            X.append(arr[t-window:t])
+            yy.append(arr[t:t + horizon_fc])
+
+        X = np.array(X, dtype="float32")
+        yy = np.array(yy, dtype="float32")
+
+        mu = float(arr.mean())
+        sigma = float(arr.std() + 1e-6)
+        X_norm = (X - mu) / sigma
+
+        model = _build_nbeats_model(
+            backcast_length=window,
+            forecast_length=horizon_fc,
+            n_blocks=n_blocks,
+            width=width,
+            n_hidden=n_hidden,
+        )
+        logger.info(
+            "NBEATS refit: window=%d n_blocks=%d width=%d n_hidden=%d samples=%d",
+            window, n_blocks, width, n_hidden, X.shape[0]
+        )
+
+        cbs = [
+            keras.callbacks.EarlyStopping(monitor="loss", patience=3, restore_best_weights=True),
+        ]
+        model.fit(
+            X_norm,
+            yy,
+            epochs=20,
+            batch_size=32,
+            verbose=0,
+            callbacks=cbs,
+        )
+
+        # авто-регрессивный прогноз на 30 шагов
+        last_window = arr[-window:].copy()
+        preds_30 = []
+        for _ in range(30):
+            lw_norm = (last_window - mu) / sigma
+            fc = model.predict(lw_norm.reshape(1, -1), verbose=0)[0]
+            yhat = float(fc[-1])
+            if not np.isfinite(yhat):
+                yhat = float(last_window[-1])
+            preds_30.append(yhat)
+            # сдвигаем окно
+            last_window = np.roll(last_window, -1)
+            last_window[-1] = yhat
+
+        return pd.Series(preds_30, index=range(1, 31))
+
+
     last = float(y.iloc[-1])
     logger.warning("refit_and_forecast_30d: unknown model type; returning flat series")
     return pd.Series([last]*30, index=range(1, 31))
@@ -652,3 +753,158 @@ def select_and_fit(
         eval_tag=eval_tag, save_plots=save_plots, artifacts_dir=artifacts_dir
     )
     return best
+
+# ---------- N-BEATS ----------
+
+def _build_nbeats_block(
+    inp,
+    backcast_length: int,
+    forecast_length: int,
+    width: int = 128,
+    n_hidden: int = 4,
+    name_prefix: str = "block",
+):
+    """
+    Один базовый N-BEATS-блок: несколько полносвязных слоёв + projection в (backcast+forecast)
+    """
+    x = inp
+    for i in range(n_hidden):
+        x = keras.layers.Dense(width, activation="relu", name=f"{name_prefix}_fc{i}")(x)
+
+    theta = keras.layers.Dense(
+        backcast_length + forecast_length,
+        activation="linear",
+        name=f"{name_prefix}_theta"
+    )(x)
+
+    backcast = keras.layers.Lambda(
+        lambda t: t[..., :backcast_length],
+        name=f"{name_prefix}_backcast"
+    )(theta)
+    forecast = keras.layers.Lambda(
+        lambda t: t[..., backcast_length:],
+        name=f"{name_prefix}_forecast"
+    )(theta)
+
+    return backcast, forecast
+
+
+def _build_nbeats_model(
+    backcast_length: int,
+    forecast_length: int,
+    n_blocks: int = 3,
+    width: int = 128,
+    n_hidden: int = 4,
+) -> keras.Model:
+    """
+    Упрощённый N-BEATS: несколько блоков, каждый уточняет backcast и forecast.
+    """
+    inp = keras.Input(shape=(backcast_length,), name="input_backcast")
+    backcast = inp
+    forecast_sum = None
+
+    for b in range(n_blocks):
+        b_backcast, b_forecast = _build_nbeats_block(
+            backcast,
+            backcast_length=backcast_length,
+            forecast_length=forecast_length,
+            width=width,
+            n_hidden=n_hidden,
+            name_prefix=f"nbeats_b{b}",
+        )
+        backcast = keras.layers.Subtract(name=f"nbeats_b{b}_backcast_sub")([backcast, b_backcast])
+        if forecast_sum is None:
+            forecast_sum = b_forecast
+        else:
+            forecast_sum = keras.layers.Add(name=f"nbeats_b{b}_forecast_add")([forecast_sum, b_forecast])
+
+    out = forecast_sum
+    model = keras.Model(inputs=inp, outputs=out, name="NBEATS")
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-3), loss="mse")
+    return model
+
+
+def _wf_nbeats(
+    y: pd.Series,
+    val_steps: int,
+    window: int = 60,
+    horizon: int = 1,
+) -> Tuple[np.ndarray, Any]:
+    """
+    Walk-forward валидация для упрощенного N-BEATS:
+    - вход: окно цен размером `window`
+    - выход: forecast_length = horizon
+    - для каждой точки в валидации переобучаем модель на train-части (как LSTM).
+    Гиперпараметры берём из .env (NBEATS_BLOCKS, NBEATS_WIDTH, ...).
+    """
+    p = y.astype(float).values
+    if len(p) < window + val_steps + 5:
+        raise ValueError("Слишком короткий ряд для N-BEATS.")
+
+    start = len(p) - val_steps
+    n_valid = min(val_steps, max(0, len(p) - (start + horizon - 1)))
+    preds: List[float] = []
+
+    model: Optional[keras.Model] = None
+
+    for i in range(n_valid):
+        t = start + i
+        train = p[:t]
+
+        if len(train) <= window:
+            preds.append(float(train[-1]))
+            model = None
+            continue
+
+        # dataset: окна длиной window -> forecast_length (=horizon) значений вперёд
+        X, yy = [], []
+        max_idx = len(train) - horizon
+        for s in range(window, max_idx):
+            X.append(train[s-window:s])
+            yy.append(train[s:s + horizon])
+
+        X = np.array(X, dtype="float32")
+        yy = np.array(yy, dtype="float32")
+        if X.shape[0] < 8:
+            preds.append(float(train[-1]))
+            model = None
+            continue
+
+        mu = float(train.mean())
+        sigma = float(train.std() + 1e-6)
+        X_norm = (X - mu) / sigma
+
+        if model is None:
+            model = _build_nbeats_model(
+                backcast_length=window,
+                forecast_length=horizon,
+                n_blocks=NBEATS_BLOCKS,
+                width=NBEATS_WIDTH,
+                n_hidden=NBEATS_HIDDEN,
+            )
+            base_epochs = NBEATS_EPOCHS
+        else:
+            base_epochs = max(4, NBEATS_EPOCHS // 2)
+
+        model.fit(
+            X_norm, yy,
+            epochs=base_epochs,
+            batch_size=NBEATS_BATCH,
+            verbose=0,
+        )
+
+        last_window = train[-window:]
+        last_norm = (last_window - mu) / sigma
+        fc = model.predict(last_norm.reshape(1, -1), verbose=0)[0]  # shape: (horizon,)
+        yhat = float(fc[-1])
+        if not np.isfinite(yhat):
+            yhat = float(train[-1])
+        preds.append(yhat)
+
+    preds = np.array(preds, dtype=float)
+    fill = float(p[start-1]) if start-1 >= 0 else float(p[0])
+    preds = _pad_to_val_steps(preds, val_steps, fill)
+
+    # сохраняем параметры, с которыми тренировали (для refit)
+    nbeats_obj = (window, horizon, NBEATS_BLOCKS, NBEATS_WIDTH, NBEATS_HIDDEN)
+    return preds, nbeats_obj
