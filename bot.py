@@ -61,6 +61,7 @@ SUPPORTED_FOREX = MAIN_FOREX
 
 HELP_TEXT = (
     "Привет! Я бот прогноза акций, криптовалют и форекса.\n\n"
+    "Обучаю ML-модели, которые строят предсказания\n\n"
     "Команды:\n"
     "/forecast <TICKER> — пример: /forecast AAPL или /forecast BTC\n"
     "/stocks — быстрый список акций\n"
