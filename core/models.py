@@ -1,9 +1,12 @@
-# models.py
+# core/models.py
 import json
 import os
 import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+import logging
+logger = logging.getLogger("models")
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -14,10 +17,9 @@ import tensorflow as tf
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
 from statsmodels.tools.sm_exceptions import ConvergenceWarning, ValueWarning
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 from tensorflow import keras
 from telegram.error import Forbidden
-
 
 # Затем предупреждения
 warnings.filterwarnings("ignore", category=ValueWarning)
@@ -39,6 +41,7 @@ DISABLE_LSTM = os.getenv('DISABLE_LSTM', '0') == '1'
 ART_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "artifacts")
 os.makedirs(ART_DIR, exist_ok=True)
 
+
 def _pad_to_val_steps(preds, val_steps, fill_value):
     """Дополняет прогнозы до нужной длины fill_value"""
     preds = np.asarray(preds, dtype=float)
@@ -47,12 +50,14 @@ def _pad_to_val_steps(preds, val_steps, fill_value):
         preds = np.concatenate([pad, preds])
     return preds
 
+
 def _safe_mape(y_true, y_pred):
     """Безопасный расчет MAPE с обработкой ошибок"""
     try:
         return float(mean_absolute_percentage_error(y_true, y_pred))
     except Exception:
         return None
+
 
 def _save_eval_plot(y_idx, y_true, y_pred, title, out_png):
     """Сохраняет график сравнения прогноза с реальными значениями"""
@@ -66,8 +71,11 @@ def _save_eval_plot(y_idx, y_true, y_pred, title, out_png):
         plt.legend()
         plt.tight_layout()
         plt.savefig(out_png, dpi=150, bbox_inches="tight")
+    except Exception:
+        logger.exception("Failed to save eval plot: %s", out_png)
     finally:
         plt.close()
+
 
 def _save_eval_json(meta: Dict[str, Any], out_json: str):
     """Сохраняет метаданные модели в JSON файл"""
@@ -75,7 +83,8 @@ def _save_eval_json(meta: Dict[str, Any], out_json: str):
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2, default=str)
     except Exception:
-        pass
+        logger.exception("Failed to save eval json: %s", out_json)
+
 
 def _valid_preds(arr: np.ndarray, val_steps: int) -> bool:
     """Проверяет валидность прогнозов"""
@@ -85,6 +94,7 @@ def _valid_preds(arr: np.ndarray, val_steps: int) -> bool:
     except Exception:
         return False
 
+
 @dataclass
 class ModelResult:
     """Класс для хранения результатов работы модели"""
@@ -93,6 +103,7 @@ class ModelResult:
     rmse: float
     model_obj: Any
     extra: Dict[str, Any]
+
 
 def _wf_random_forest(
     y: pd.Series,
@@ -149,6 +160,7 @@ def _wf_random_forest(
     preds = _pad_to_val_steps(preds, val_steps, fill)
     return preds, model
 
+
 def _choose_sarimax_config(y_train: pd.Series):
     """Подбирает оптимальную конфигурацию SARIMAX через grid search"""
     y_train = y_train.astype(float)
@@ -200,10 +212,14 @@ def _choose_sarimax_config(y_train: pd.Series):
         best = ((1, 1, 1), (0, 0, 0, 5), 'n')
 
     try:
-        print(f"DEBUG: SARIMAX grid tried {tried}/{total}, best={best}, best_aic={best_aic:.2f}")
+        logger.debug(
+            "SARIMAX grid search tried %d/%d configs, best=%s, best_aic=%.2f",
+            tried, total, best, best_aic
+        )
     except Exception:
         pass
     return best
+
 
 def _wf_sarimax(y: pd.Series, val_steps: int, horizon: int = 1):
     """Walk-forward валидация для SARIMAX модели"""
@@ -240,8 +256,15 @@ def _wf_sarimax(y: pd.Series, val_steps: int, horizon: int = 1):
     preds = _pad_to_val_steps(preds, val_steps, fill)
     return preds, (order, seas, trend, last_fit)
 
-def _wf_lstm(y: pd.Series, val_steps: int, window: int = 30,
-             epochs: int = 8, batch_size: int = 16, horizon: int = 1):
+
+def _wf_lstm(
+    y: pd.Series,
+    val_steps: int,
+    window: int = 30,
+    epochs: int = 8,
+    batch_size: int = 16,
+    horizon: int = 1
+):
     """Walk-forward валидация для LSTM на лог-доходностях"""
     p = y.astype(float).values
     if len(p) < window + val_steps + 5:
@@ -313,6 +336,7 @@ def _wf_lstm(y: pd.Series, val_steps: int, window: int = 30,
 
     return preds_prices, (model, (last_mu, last_sigma), window, 'returns')
 
+
 def select_and_fit_with_candidates(
     y: pd.Series,
     val_steps: int = 30,
@@ -334,6 +358,7 @@ def select_and_fit_with_candidates(
 
     candidates: List[ModelResult] = []
 
+    # RandomForest семейство
     for lag in (20, 30, 60, 90):
         try:
             rf_preds, rf_obj = _wf_random_forest(y, max_lag=lag, val_steps=val_steps, horizon=horizon)
@@ -347,6 +372,7 @@ def select_and_fit_with_candidates(
                     extra={"type": "rf", "lag": lag}
                 )
                 candidates.append(res)
+                logger.debug("RF candidate lag=%d rmse=%.4f", lag, rmse)
                 if save_plots:
                     tag = (eval_tag or "series").upper()
                     base = f"eval_{tag}_rf_lag{lag}"
@@ -367,8 +393,9 @@ def select_and_fit_with_candidates(
                         os.path.join(artifacts_dir, f"{base}.json"),
                     )
         except Exception:
-            pass
+            logger.exception("RF candidate failed for lag=%d", lag)
 
+    # SARIMAX
     try:
         sarimax_preds, sarimax_obj = _wf_sarimax(y, val_steps=val_steps, horizon=horizon)
         if _valid_preds(sarimax_preds, val_steps):
@@ -381,6 +408,7 @@ def select_and_fit_with_candidates(
                 extra={"type": "sarimax"}
             )
             candidates.append(res)
+            logger.debug("SARIMAX candidate rmse=%.4f", rmse)
             if save_plots:
                 tag = (eval_tag or "series").upper()
                 base = f"eval_{tag}_sarimax"
@@ -400,16 +428,19 @@ def select_and_fit_with_candidates(
                     os.path.join(artifacts_dir, f"{base}.json"),
                 )
         else:
-            print("DEBUG: SARIMAX produced invalid preds (nan/len mismatch)")
+            logger.warning("SARIMAX produced invalid preds (nan/len mismatch)")
     except Exception as e:
-        print(f"DEBUG: SARIMAX failed: {e}")
+        logger.exception("SARIMAX failed: %s", e)
 
+    # LSTM (если не отключён)
     if not DISABLE_LSTM:
         best_lstm: Optional[ModelResult] = None
         for win in (60, 90, 120):
             try:
-                lstm_preds, lstm_obj = _wf_lstm(y, val_steps=val_steps, window=win, epochs=8,
-                                                batch_size=16, horizon=horizon)
+                lstm_preds, lstm_obj = _wf_lstm(
+                    y, val_steps=val_steps, window=win, epochs=8,
+                    batch_size=16, horizon=horizon
+                )
                 if _valid_preds(lstm_preds, val_steps):
                     rmse = mean_squared_error(y_true, lstm_preds, squared=False)
                     cand = ModelResult(
@@ -419,6 +450,7 @@ def select_and_fit_with_candidates(
                         model_obj=lstm_obj,
                         extra={"type": "lstm", "window": win}
                     )
+                    logger.debug("LSTM candidate window=%d rmse=%.4f", win, rmse)
                     if save_plots:
                         tag = (eval_tag or "series").upper()
                         base = f"eval_{tag}_lstm_win{win}"
@@ -441,12 +473,15 @@ def select_and_fit_with_candidates(
                     if (best_lstm is None) or (cand.rmse < best_lstm.rmse):
                         best_lstm = cand
             except Exception:
-                pass
+                logger.exception("LSTM candidate failed for window=%d", win)
         if best_lstm is not None:
             candidates.append(best_lstm)
 
     try:
-        print("DEBUG: candidates RMSE:", ", ".join(f"{c.name}={c.rmse:.4f}" for c in candidates))
+        logger.info(
+            "Model candidates: %s",
+            ", ".join(f"{c.name}={c.rmse:.4f}" for c in candidates)
+        )
     except Exception:
         pass
 
@@ -457,6 +492,8 @@ def select_and_fit_with_candidates(
 
     if not _valid_preds(best.yhat_val, val_steps):
         raise RuntimeError(f"Лучшая модель '{best.name}' вернула некорректный валидационный прогноз.")
+
+    logger.info("Winner model: %s rmse=%.4f", best.name, best.rmse)
 
     if save_plots:
         tag = (eval_tag or "series").upper()
@@ -474,7 +511,8 @@ def select_and_fit_with_candidates(
                 "val_steps": val_steps,
                 "horizon": horizon,
                 "candidates": [
-                    {"name": c.name, "rmse": float(c.rmse)} for c in sorted(candidates, key=lambda x: x.rmse)
+                    {"name": c.name, "rmse": float(c.rmse)}
+                    for c in sorted(candidates, key=lambda x: x.rmse)
                 ],
             },
             os.path.join(artifacts_dir, f"{base}.json"),
@@ -482,9 +520,12 @@ def select_and_fit_with_candidates(
 
     return best, candidates
 
+
 def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
     """Переобучает лучшую модель на всех данных и строит 30-дневный прогноз"""
     y = y.astype(float)
+
+    logger.info("refit_and_forecast_30d using model '%s' type=%s", best.name, best.extra.get("type"))
 
     if best.extra.get("type") == "rf":
         rf_obj, max_lag = best.model_obj
@@ -508,8 +549,10 @@ def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
 
     elif best.extra.get("type") == "sarimax":
         order, seas, trend, _ = best.model_obj
-        model = sm.tsa.SARIMAX(y, order=order, seasonal_order=seas, trend=trend,
-                               enforce_stationarity=False, enforce_invertibility=False)
+        model = sm.tsa.SARIMAX(
+            y, order=order, seasonal_order=seas, trend=trend,
+            enforce_stationarity=False, enforce_invertibility=False
+        )
         res = model.fit(disp=False)
         fcst = res.get_forecast(steps=30).predicted_mean.values
         return pd.Series(fcst, index=range(1, 31))
@@ -531,6 +574,7 @@ def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
                 X.append(r_norm[k-window:k, 0])
                 yy.append(r_norm[k, 0])
             if len(X) == 0:
+                logger.warning("LSTM refit: too few samples; returning flat series")
                 return pd.Series([float(p[-1])]*30, index=range(1, 31))
 
             X = np.array(X)[..., None]
@@ -563,6 +607,7 @@ def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
                 X.append(y_norm[t-window:t, 0])
                 yy.append(y_norm[t, 0])
             if len(X) == 0:
+                logger.warning("LSTM refit (direct): too few samples; returning flat series")
                 return pd.Series([float(y.iloc[-1])]*30, index=range(1, 31))
 
             X = np.array(X)[..., None]
@@ -589,7 +634,9 @@ def refit_and_forecast_30d(y: pd.Series, best: ModelResult) -> pd.Series:
             return pd.Series(preds_denorm, index=range(1, 31))
 
     last = float(y.iloc[-1])
+    logger.warning("refit_and_forecast_30d: unknown model type; returning flat series")
     return pd.Series([last]*30, index=range(1, 31))
+
 
 def select_and_fit(
     y: pd.Series,
@@ -605,4 +652,3 @@ def select_and_fit(
         eval_tag=eval_tag, save_plots=save_plots, artifacts_dir=artifacts_dir
     )
     return best
-
