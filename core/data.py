@@ -23,17 +23,17 @@ CRYPTO_MAP: Dict[str, str] = {
     # Топ-10, как было
     "BTC":  "BTC-USD",
     "ETH":  "ETH-USD",
+    "DOGE": "DOGE-USD",
+    "TON":  "TON-USD",
     "BNB":  "BNB-USD",
     "SOL":  "SOL-USD",
     "XRP":  "XRP-USD",
     "ADA":  "ADA-USD",
-    "DOGE": "DOGE-USD",
     "TRX":  "TRX-USD",
-    "AVAX": "AVAX-USD",
     "LTC":  "LTC-USD",
 
     # Добавляем ещё ~30 ликвидных монет
-    "TON":  "TON-USD",
+    "AVAX": "AVAX-USD",
     "LINK": "LINK-USD",
     "MATIC": "MATIC-USD",
     "DOT":  "DOT-USD",

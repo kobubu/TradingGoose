@@ -139,7 +139,8 @@ from handlers_pro import (
     reminders_job,
     payments_redeem_job,
     debug_signal_now_cmd,      # ← добавили
-    debug_remind_now_cmd,      # ← добавили
+    debug_remind_now_cmd,
+    debug_warmup_cmd,      # ← добавили
 )
 
 
@@ -919,6 +920,7 @@ def main():
     app.add_handler(CommandHandler("debug_payments", debug_payments_cmd))
     app.add_handler(CommandHandler("debug_payments_reset", debug_payments_reset_cmd))
     app.add_handler(CommandHandler("debug_models", debug_models_cmd))
+    app.add_handler(CommandHandler("debug_warmup", debug_warmup_cmd))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_error_handler(error_handler)
 

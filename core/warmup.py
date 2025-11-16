@@ -2,6 +2,42 @@
 import asyncio
 import logging
 import os
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+WARMUP_CHUNK = int(os.getenv("WARMUP_CHUNK", "5"))
+
+def _interleave_chunks(crypto, stocks, forex, chunk_size: int = 5):
+    """
+    Склеиваем списки кусками:
+    5 крипты, 5 акций, 5 форекс, снова 5 крипты, 5 акций, 5 форекс, ...
+    """
+    res = []
+    i = j = k = 0
+    n_c, n_s, n_f = len(crypto), len(stocks), len(forex)
+
+    while i < n_c or j < n_s or k < n_f:
+        if i < n_c:
+            res.extend(crypto[i:i + chunk_size])
+            i += chunk_size
+        if j < n_s:
+            res.extend(stocks[j:j + chunk_size])
+            j += chunk_size
+        if k < n_f:
+            res.extend(forex[k:k + chunk_size])
+            k += chunk_size
+
+    # убираем дубликаты с сохранением порядка (на всякий случай)
+    seen = set()
+    out = []
+    for t in res:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
 import time
 from typing import Awaitable, Callable, Optional
 
@@ -15,17 +51,24 @@ WARMUP_INTERVAL_SEC = int(os.getenv("WARMUP_INTERVAL_SEC", "30"))  # тольк�
 
 # --- список тикеров, которые будем греть ---
 try:
-    # можно использовать те же списки, что и в Signal Mode
     from handlers_pro import SUPPORTED_TICKERS, SUPPORTED_CRYPTO, SUPPORTED_FOREX
 
-    _all = list(dict.fromkeys(
-        list(SUPPORTED_TICKERS) + list(SUPPORTED_CRYPTO) + list(SUPPORTED_FOREX)
-    ))
+    WARMUP_TICKERS = _interleave_chunks(
+        list(SUPPORTED_CRYPTO),
+        list(SUPPORTED_TICKERS),
+        list(SUPPORTED_FOREX),
+        chunk_size=WARMUP_CHUNK,
+    )
+    logger.info(
+        "warmup: built WARMUP_TICKERS with pattern %d/%d/%d, total=%d",
+        min(WARMUP_CHUNK, len(SUPPORTED_CRYPTO)),
+        min(WARMUP_CHUNK, len(SUPPORTED_TICKERS)),
+        min(WARMUP_CHUNK, len(SUPPORTED_FOREX)),
+        len(WARMUP_TICKERS),
+    )
 except Exception:
-    logger.warning("warmup: failed to import SUPPORTED_* from handlers_pro, warmup list is empty")
-    _all = []
-
-WARMUP_TICKERS = _all
+    logger.exception("warmup: failed to import SUPPORTED_* from handlers_pro, warmup list is empty")
+    WARMUP_TICKERS = []
 
 # --- состояние warmup-цикла ---
 WARMUP_INDEX = 0
@@ -154,3 +197,24 @@ async def warmup_job(context) -> None:
     Обёртка для JobQueue (подпись (context) обязательна).
     """
     await warmup_one()
+
+def get_debug_info(max_tickers: int = 30) -> dict:
+    """
+    Возвращает диагностическую информацию о warmup-цикле
+    для /debug_warmup.
+    """
+    try:
+        last_iso = datetime.fromtimestamp(LAST_USER_ACTIVITY_TS).isoformat()
+    except Exception:
+        last_iso = f"{LAST_USER_ACTIVITY_TS}"
+
+    return {
+        "idle_sec_for_warmup": IDLE_SEC_FOR_WARMUP,
+        "interval_sec": WARMUP_INTERVAL_SEC,
+        "last_user_activity_ts": LAST_USER_ACTIVITY_TS,
+        "last_user_activity_iso": last_iso,
+        "current_ticker": WARMUP_CURRENT_TICKER,
+        "index": WARMUP_INDEX,
+        "total_tickers": len(WARMUP_TICKERS),
+        "tickers_preview": WARMUP_TICKERS[:max_tickers],
+    }

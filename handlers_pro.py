@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta as _td
 from zoneinfo import ZoneInfo
+from core import warmup
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -660,3 +661,52 @@ async def debug_remind_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("❌ Ошибка при отправке тестового напоминания. Смотри логи.")
 
 
+async def debug_warmup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /debug_warmup — показать состояние idle-прогрева моделей (warmup).
+    Только для владельца бота.
+    """
+    u = update.effective_user
+    msg = update.effective_message
+
+    if not u or not _is_owner(u.id):
+        await msg.reply_text("Эта команда доступна только владельцу бота.")
+        return
+
+    info = warmup.get_debug_info()
+
+    lines = [
+        "🔥 Warmup debug",
+        "",
+        f"Idle threshold (sec): {info.get('idle_sec_for_warmup')}",
+        f"Job interval (sec):  {info.get('interval_sec')}",
+        "",
+        f"Last user activity ts:  {info.get('last_user_activity_ts')}",
+        f"Last user activity iso: {info.get('last_user_activity_iso')}",
+        "",
+        f"Current ticker:   {info.get('current_ticker') or '—'}",
+        f"WARMUP_INDEX:     {info.get('index')}",
+        f"Total tickers:    {info.get('total_tickers')}",
+        "",
+        "Preview очереди (первые):",
+    ]
+
+    preview = info.get("tickers_preview") or []
+    if preview:
+        # разбиваем по строкам по несколько тикеров
+        row = []
+        for i, t in enumerate(preview, start=1):
+            row.append(t)
+            if i % 8 == 0:  # по 8 в строке
+                lines.append("  " + ", ".join(row))
+                row = []
+        if row:
+            lines.append("  " + ", ".join(row))
+    else:
+        lines.append("  <empty>")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (truncated)"
+
+    await msg.reply_text(f"```text\n{text}\n```", parse_mode="Markdown")

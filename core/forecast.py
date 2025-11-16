@@ -4,35 +4,61 @@ import io
 import json
 import os
 import time
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 
-import logging 
+import logging
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
-from core.subs import can_consume, consume_one, get_status, is_pro, get_limits
 import statsmodels.api as sm
 
 from . import model_cache
 from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 
-logger = logging.getLogger(__name__) 
+logger = logging.getLogger(__name__)
 
 MODEL_VERSION = "v1"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 
 
-def _make_data_signature(df: pd.DataFrame) -> str:
-    last_dt = pd.to_datetime(df.index[-1]).date().isoformat()
-    # Делаем сигнатуру устойчивее: убираем цену вовсе ИЛИ округляем грубо.
+# ---------- Data signature для кэша ----------
+
+def _make_data_signature(df: pd.DataFrame, tail_len: int = 256) -> str:
+    """
+    Сигнатура данных для кэша моделей/прогнозов.
+
+    Зависит от:
+      - числа точек (n)
+      - первой и последней даты
+      - sha1-хеша последних tail_len значений Close (в float32)
+
+    Если приходит новая свечка или меняется хвост истории — сигнатура меняется.
+    При пересчитывании тех же данных — остаётся той же.
+    """
+    if df is None or df.empty:
+        raise ValueError("Empty dataframe in _make_data_signature")
+
+    idx = pd.to_datetime(df.index)
+    n = int(len(df))
+    start_dt = idx[0].date().isoformat()
+    end_dt = idx[-1].date().isoformat()
+
+    closes = df["Close"].astype("float32").to_numpy()
+    tail = closes[-tail_len:] if n > tail_len else closes
+
+    tail_bytes = tail.tobytes()
+    tail_hash = hashlib.sha1(tail_bytes).hexdigest()
+
     payload = {
-        "last_dt": last_dt,
-        "n": int(len(df)),
+        "n": n,
+        "start": start_dt,
+        "end": end_dt,
+        "tail_sha1": tail_hash,
     }
-    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _make_future_index(last_ts: pd.Timestamp, periods: int, ticker: str) -> pd.DatetimeIndex:
@@ -45,18 +71,61 @@ def _make_future_index(last_ts: pd.Timestamp, periods: int, ticker: str) -> pd.D
     return pd.bdate_range(start=start, periods=periods)
 
 
+# ---------- Ансамбли ----------
+
 def _build_ensembles_from_candidates(
     y: pd.Series,
     candidates,
-    future_idx: pd.DatetimeIndex
+    future_idx: pd.DatetimeIndex,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    all_fcsts: List[np.ndarray] = []
-    for c in candidates:
+    """
+    Строим 2 ансамбля:
+      - среднее по всем кандидатам
+      - среднее по топ-3 по RMSE
+
+    Плюс sanity-check: выкидываем явных «поехавших» кандидатов, у которых
+    прогнозы в десятки раз больше/меньше текущей цены или содержат NaN/inf.
+    """
+    last_close = float(y.iloc[-1])
+    if not np.isfinite(last_close) or last_close == 0.0:
+        last_close = 1.0
+
+    SCALE_FACTOR = 50.0  # максимум ×50 от последней цены
+
+    def _safe_fcst_for_candidate(cand) -> Optional[np.ndarray]:
         try:
-            s = refit_and_forecast_30d(y, c)
-            all_fcsts.append(s.values.astype(float))
+            s = refit_and_forecast_30d(y, cand)
+            arr = s.values.astype(float)
+            if arr.size == 0:
+                return None
+            if not np.all(np.isfinite(arr)):
+                logger.warning("Skip candidate %s: non-finite values in forecast",
+                               getattr(cand, "name", "?"))
+                return None
+            max_abs = float(np.max(np.abs(arr)))
+            if max_abs > abs(last_close) * SCALE_FACTOR:
+                logger.warning(
+                    "Skip candidate %s: insane forecast scale max=%.3g last_close=%.3g",
+                    getattr(cand, "name", "?"),
+                    max_abs,
+                    last_close,
+                )
+                return None
+            return arr
         except Exception:
-            pass
+            logger.exception("refit_and_forecast_30d failed for candidate %s",
+                             getattr(cand, "name", "?"))
+            return None
+
+    # --- среднее по ВСЕМ кандидатам (после фильтрации) ---
+    all_fcsts: List[np.ndarray] = []
+    good_candidates = []
+    for c in candidates:
+        arr = _safe_fcst_for_candidate(c)
+        if arr is not None:
+            all_fcsts.append(arr)
+            good_candidates.append(c)
+
     if all_fcsts:
         mat = np.vstack(all_fcsts)
         avg_all = np.nanmean(mat, axis=0)
@@ -64,14 +133,18 @@ def _build_ensembles_from_candidates(
     else:
         fcst_avg_all = pd.DataFrame({"forecast": []})
 
-    top3 = sorted(candidates, key=lambda c: float(c.rmse))[:3]
+    # --- топ-3 по RMSE среди "хороших" кандидатов ---
+    if good_candidates:
+        top3 = sorted(good_candidates, key=lambda c: float(c.rmse))[:3]
+    else:
+        top3 = []
+
     top3_mat: List[np.ndarray] = []
     for c in top3:
-        try:
-            s = refit_and_forecast_30d(y, c)
-            top3_mat.append(s.values.astype(float))
-        except Exception:
-            pass
+        arr = _safe_fcst_for_candidate(c)
+        if arr is not None:
+            top3_mat.append(arr)
+
     if top3_mat:
         top3_avg = np.nanmean(np.vstack(top3_mat), axis=0)
         fcst_avg_top3 = pd.DataFrame({"forecast": top3_avg}, index=future_idx)
@@ -81,61 +154,77 @@ def _build_ensembles_from_candidates(
     return fcst_avg_all, fcst_avg_top3
 
 
-def _is_fresh(meta: Dict[str, any], ttl: int) -> bool:
+def _is_fresh(meta: Dict[str, Any], ttl: int) -> bool:
     try:
-        return (meta.get("model_version") == MODEL_VERSION
-                and (time.time() - int(meta.get("trained_at", 0)) <= ttl))
+        return (
+            meta.get("model_version") == MODEL_VERSION
+            and (time.time() - int(meta.get("trained_at", 0)) <= ttl)
+        )
     except Exception:
         return False
 
+
+# ---------- Основной пайплайн ----------
 
 def train_select_and_forecast(
     df: pd.DataFrame,
     ticker: Optional[str] = None,
     force_retrain: bool = False,
 ) -> Tuple[Dict, Dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    logger.info("train_select_and_forecast: ticker=%s, len=%d, force_retrain=%s",
-                ticker, len(df), force_retrain)
+    logger.info(
+        "train_select_and_forecast: ticker=%s, len=%d, force_retrain=%s",
+        ticker,
+        len(df),
+        force_retrain,
+    )
+
     y = df["Close"].copy()
     val_steps = min(30, max(10, len(y) // 10))
     future_idx = _make_future_index(df.index[-1], 30, ticker or "")
 
-    # 1) ключи КЭША сначала
+    # 1) считаем сигнатуру и ключи кэша
     data_sig = _make_data_signature(df)
-    params = {"val_steps": val_steps, "disable_lstm": os.getenv("DISABLE_LSTM", "0") == "1"}
+    params = {
+        "val_steps": val_steps,
+        "disable_lstm": os.getenv("DISABLE_LSTM", "0") == "1",
+    }
     model_key = model_cache.make_cache_key(ticker or "N/A", "auto", params, data_sig)
     fc_key = model_cache.make_forecasts_key(ticker or "N/A", data_sig)
 
-    # 2) теперь безопасно логируем
     try:
-        print(f"DEBUG: ticker={ticker}  len={len(df)}  last_dt={pd.to_datetime(df.index[-1]).date().isoformat()}")
-        print(f"DEBUG: model_key={model_key}")
-        print(f"DEBUG: fc_key={fc_key}")
+        logger.debug(
+            "DSIG: ticker=%s len=%d last_dt=%s model_key=%s fc_key=%s",
+            ticker,
+            len(df),
+            pd.to_datetime(df.index[-1]).date().isoformat(),
+            model_key,
+            fc_key,
+        )
     except Exception:
         pass
 
-    # ---------- сначала пробуем достать 3 прогноза из кеша ----------
+    # ---------- 2. Пробуем достать 3 прогноза из кэша ----------
     if ticker and not force_retrain:
         fb, fa, ft, fmeta = model_cache.load_forecasts(fc_key)
         if fb is not None and fa is not None and ft is not None and fmeta is not None:
             if _is_fresh(fmeta, MODEL_CACHE_TTL_SECONDS) and fmeta.get("data_sig") == data_sig:
-                print("DEBUG: forecasts cache HIT (fresh) → use saved 3x forecasts")
+                logger.info("Forecasts cache HIT (fresh) for %s", ticker)
                 best_dict = {"name": fmeta.get("best_name", "cached_best")}
                 metrics = fmeta.get("metrics", {"rmse": None, "mape": None})
                 return best_dict, metrics, fb, fa, ft
             else:
-                # иначе просто пересчитаем и перезапишем
-                print("DEBUG: forecasts cache STALE → recompute & overwrite")
+                logger.info("Forecasts cache STALE for %s → recompute", ticker)
 
-    # ---------- Далее логика: пытаемся использовать кэш модели для "best" ----------
+    # ---------- 3. Пробуем достать модель-победителя из кэша ----------
     best_dict: Dict[str, Optional[str]] = {"name": None}
     metrics: Dict[str, Optional[float]] = {"rmse": None, "mape": None}
     fcst_best_df: Optional[pd.DataFrame] = None
     fcst_avg_all_df: Optional[pd.DataFrame] = None
     fcst_avg_top3_df: Optional[pd.DataFrame] = None
 
-    def _save_three(best_name: str, metrics_obj: Dict[str, any], fb, fa, ft):
-        """Сохранить три варианта прогноза + метаданные, включая тикер."""
+    def _save_three(best_name: str, metrics_obj: Dict[str, Any],
+                    fb: pd.DataFrame, fa: pd.DataFrame, ft: pd.DataFrame):
+        """Сохранить три варианта прогноза + метаданные."""
         meta = {
             "best_name": best_name,
             "metrics": metrics_obj,
@@ -146,12 +235,12 @@ def train_select_and_forecast(
         }
         model_cache.save_forecasts(fc_key, fb, fa, ft, meta)
 
-    # --- sklearn best
+    # --- sklearn (RF) ---
     if ticker and not force_retrain:
         skl_model, skl_meta = model_cache.load_sklearn_model(model_key)
         if skl_model is not None and _is_fresh(skl_meta or {}, MODEL_CACHE_TTL_SECONDS):
             try:
-                lag = int(skl_meta.get("extra", {}).get("lag", 30))
+                lag = int((skl_meta.get("extra") or {}).get("lag", 30))
                 arr = y.values.astype(float)
                 if len(arr) >= lag + 1:
                     last_window = arr[-lag:].copy()
@@ -161,13 +250,16 @@ def train_select_and_forecast(
                         preds.append(float(yhat))
                         last_window = np.roll(last_window, -1)
                         last_window[-1] = yhat
-                    fcst_best_df = pd.DataFrame({"forecast": np.array(preds)}, index=future_idx)
+                    fcst_best_df = pd.DataFrame(
+                        {"forecast": np.array(preds)}, index=future_idx
+                    )
                     best_dict["name"] = skl_meta.get("name", "cached_sklearn")
                     metrics = skl_meta.get("metrics", {"rmse": None, "mape": None})
+                    logger.info("Loaded cached sklearn model for %s", ticker)
             except Exception:
-                pass
+                logger.exception("Error using cached sklearn model for %s", ticker)
 
-    # --- SARIMAX best
+    # --- SARIMAX ---
     if fcst_best_df is None and ticker and not force_retrain:
         sm_res, sm_meta = model_cache.load_statsmodels_result(model_key)
         if sm_res is not None and _is_fresh(sm_meta or {}, MODEL_CACHE_TTL_SECONDS):
@@ -176,32 +268,42 @@ def train_select_and_forecast(
                 fcst_best_df = pd.DataFrame({"forecast": fcst}, index=future_idx)
                 best_dict["name"] = sm_meta.get("name", "cached_sarimax")
                 metrics = sm_meta.get("metrics", {"rmse": None, "mape": None})
+                logger.info("Loaded cached SARIMAX model for %s", ticker)
             except Exception:
-                pass
+                logger.exception("Error using cached SARIMAX model for %s", ticker)
 
-    # --- LSTM best
+    # --- LSTM ---
     if fcst_best_df is None and ticker and not force_retrain:
         tf_model, tf_meta = model_cache.load_tf_model(model_key)
         if tf_model is not None and _is_fresh(tf_meta or {}, MODEL_CACHE_TTL_SECONDS):
             try:
-                mu = float(tf_meta["extra"]["mu"])
-                sigma = float(tf_meta["extra"]["sigma"])
-                window = int(tf_meta["extra"]["window"])
+                extra = tf_meta.get("extra") or {}
+                mu = float(extra["mu"])
+                sigma = float(extra["sigma"])
+                window = int(extra["window"])
+
                 arr = y.values.astype("float32").reshape(-1, 1)
                 norm = (arr - mu) / sigma
                 last_seq = norm[-window:, 0].reshape(1, window, 1)
+
                 preds = []
                 for _ in range(30):
                     yhat = tf_model.predict(last_seq, verbose=0).reshape(-1)[0]
                     preds.append(float(yhat * sigma + mu))
-                    last_seq = np.concatenate([last_seq[0, 1:, 0], [yhat]]).reshape(1, window, 1)
-                fcst_best_df = pd.DataFrame({"forecast": np.array(preds)}, index=future_idx)
+                    last_seq = np.concatenate(
+                        [last_seq[0, 1:, 0], [yhat]]
+                    ).reshape(1, window, 1)
+
+                fcst_best_df = pd.DataFrame(
+                    {"forecast": np.array(preds)}, index=future_idx
+                )
                 best_dict["name"] = tf_meta.get("name", "cached_lstm")
                 metrics = tf_meta.get("metrics", {"rmse": None, "mape": None})
+                logger.info("Loaded cached LSTM model for %s", ticker)
             except Exception:
-                pass
+                logger.exception("Error using cached LSTM model for %s", ticker)
 
-    # ---------- Если "best" уже есть из кэша — считаем кандидатов и ансамбли, потом сохраняем 3 прогноза ----------
+    # ---------- 4. Если best есть из кэша: считаем ансамбли и сохраняем три прогноза ----------
     if fcst_best_df is not None:
         _, candidates = select_and_fit_with_candidates(
             y,
@@ -210,16 +312,24 @@ def train_select_and_forecast(
             eval_tag=ticker,
             save_plots=False,
         )
-        fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(y, candidates, future_idx)
+        fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
+            y, candidates, future_idx
+        )
         if fcst_avg_all_df.empty:
             fcst_avg_all_df = fcst_best_df.copy()
         if fcst_avg_top3_df.empty:
             fcst_avg_top3_df = fcst_best_df.copy()
 
-        _save_three(best_dict["name"] or "cached_best", metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df)
+        _save_three(
+            best_dict["name"] or "cached_best",
+            metrics,
+            fcst_best_df,
+            fcst_avg_all_df,
+            fcst_avg_top3_df,
+        )
         return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
-    # ---------- Обучение с нуля ----------
+    # ---------- 5. Обучение с нуля ----------
     best, candidates = select_and_fit_with_candidates(
         y,
         val_steps=val_steps,
@@ -228,30 +338,36 @@ def train_select_and_forecast(
         save_plots=True,
     )
 
-    # Прогноз лучшей
+    # Прогноз лучшей модели
     y_fcst_30 = refit_and_forecast_30d(y, best)
     fcst_best_df = pd.DataFrame({"forecast": y_fcst_30.values}, index=future_idx)
 
     # Ансамбли
-    fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(y, candidates, future_idx)
+    fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
+        y, candidates, future_idx
+    )
     if fcst_avg_all_df.empty:
         fcst_avg_all_df = fcst_best_df.copy()
     if fcst_avg_top3_df.empty:
         fcst_avg_top3_df = fcst_best_df.copy()
 
     # Метрики
-    rmse = mean_squared_error(y.iloc[-val_steps:], best.yhat_val[-val_steps:], squared=False)
+    rmse = mean_squared_error(
+        y.iloc[-val_steps:], best.yhat_val[-val_steps:], squared=False
+    )
     try:
-        mape = mean_absolute_percentage_error(y.iloc[-val_steps:], best.yhat_val[-val_steps:])
+        mape = mean_absolute_percentage_error(
+            y.iloc[-val_steps:], best.yhat_val[-val_steps:]
+        )
     except Exception:
         mape = np.nan
+
     best_dict = {"name": best.name}
     metrics = {"rmse": float(rmse), "mape": float(mape) if mape == mape else None}
 
-    # Сохраняем модель(и) и ТРИ прогноза
+    # ---------- 6. Сохраняем модель-победителя и три прогноза ----------
     try:
         if ticker:
-            # сохранить модель-победителя (как и раньше)
             meta_model = {
                 "name": best.name,
                 "trained_at": int(time.time()),
@@ -259,11 +375,14 @@ def train_select_and_forecast(
                 "extra": getattr(best, "extra", {}),
                 "model_version": MODEL_VERSION,
                 "data_sig": data_sig,
+                "ticker": (ticker or "N/A").upper(),
             }
+
             if best.extra.get("type") == "rf":
                 rf_obj, lag = best.model_obj
                 meta_model["extra"] = {"lag": int(lag)}
                 model_cache.save_sklearn_model(model_key, rf_obj, meta_model)
+
             elif best.extra.get("type") == "sarimax":
                 order, seas, trend, _ = best.model_obj
                 m = sm.tsa.SARIMAX(
@@ -275,27 +394,41 @@ def train_select_and_forecast(
                     enforce_invertibility=False,
                 )
                 res = m.fit(disp=False)
-                meta_model["extra"] = {"order": order, "seasonal_order": seas, "trend": trend}
+                meta_model["extra"] = {
+                    "order": order,
+                    "seasonal_order": seas,
+                    "trend": trend,
+                }
                 model_cache.save_statsmodels_result(model_key, res, meta_model)
+
             elif best.extra.get("type") == "lstm":
                 mo = best.model_obj
                 if len(mo) == 4 and mo[-1] == "returns":
                     model, (mu, sigma), window, _ = mo
                 else:
                     model, (mu, sigma), window = mo
-                meta_model["extra"] = {"mu": float(mu), "sigma": float(sigma), "window": int(window)}
+                meta_model["extra"] = {
+                    "mu": float(mu),
+                    "sigma": float(sigma),
+                    "window": int(window),
+                }
                 model_cache.save_tf_model(model_key, model, meta_model)
 
-            # сохранить ТРИ прогноза (через наш helper, с тикером)
             _save_three(best.name, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df)
 
-    except Exception as e:
-        print(f"[ERR] save_forecasts failed: {e}")
-        raise
+    except Exception:
+        logger.exception("Saving model/forecasts failed for %s", ticker)
 
-    print(f"DEBUG: trained from scratch. winner={best_dict['name']}, rmse={metrics['rmse']:.4f}")
+    logger.info(
+        "Trained from scratch: ticker=%s winner=%s rmse=%.4f",
+        ticker,
+        best_dict["name"],
+        metrics["rmse"] if metrics["rmse"] is not None else float("nan"),
+    )
     return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
+
+# ---------- Плоттеры ----------
 
 def make_plot_image(
     history_df: pd.DataFrame,
@@ -315,22 +448,18 @@ def make_plot_image(
 
     try:
         if markers:
-            ymin, ymax = plt.ylim()
             for m in markers:
-                if isinstance(m, dict):
-                    side = m.get("side", "long")
-                    dt = m.get("sell") if side == "short" else m.get("buy")
-                else:
-                    try:
+                try:
+                    if isinstance(m, dict):
+                        side = m.get("side", "long")
+                        dt = m.get("sell") if side == "short" else m.get("buy")
+                    else:
                         dt, _label = m
-                    except Exception:
+                    if dt is None:
                         continue
-
-                if dt is None:
+                    plt.axvline(dt, linestyle="--", alpha=0.35)
+                except Exception:
                     continue
-
-                plt.axvline(dt, linestyle="--", alpha=0.35)
-                # подписи можно не рисовать, чтобы не захламлять
     except Exception:
         pass
 
@@ -343,7 +472,6 @@ def make_plot_image(
     plt.close()
     buf.seek(0)
     return buf
-
 
 
 def export_plot_pdf(history_df: pd.DataFrame, forecast_df: pd.DataFrame, ticker: str, out_path: str) -> None:
