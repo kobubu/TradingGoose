@@ -817,6 +817,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))  # ← добавили /help
     app.add_handler(CommandHandler("forecast", forecast))
+    app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("stocks", stocks))
     app.add_handler(CommandHandler("crypto", crypto))
     app.add_handler(CommandHandler("forex", forex))
@@ -837,6 +838,7 @@ def main():
     app.add_handler(CommandHandler("debug_payments", debug_payments_cmd))
     app.add_handler(CommandHandler("debug_payments_reset", debug_payments_reset_cmd))
     app.add_handler(CommandHandler("debug_models", debug_models_cmd))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_error_handler(error_handler)
 
     # джобы
