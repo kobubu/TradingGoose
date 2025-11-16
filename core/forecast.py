@@ -6,6 +6,8 @@ import os
 import time
 from typing import Dict, Optional, Tuple, List
 
+import logging 
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -15,6 +17,8 @@ import statsmodels.api as sm
 
 from . import model_cache
 from .models import refit_and_forecast_30d, select_and_fit_with_candidates
+
+logger = logging.getLogger(__name__) 
 
 MODEL_VERSION = "v1"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
@@ -90,6 +94,8 @@ def train_select_and_forecast(
     ticker: Optional[str] = None,
     force_retrain: bool = False,
 ) -> Tuple[Dict, Dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    logger.info("train_select_and_forecast: ticker=%s, len=%d, force_retrain=%s",
+                ticker, len(df), force_retrain)
     y = df["Close"].copy()
     val_steps = min(30, max(10, len(y) // 10))
     future_idx = _make_future_index(df.index[-1], 30, ticker or "")
@@ -310,9 +316,21 @@ def make_plot_image(
     try:
         if markers:
             ymin, ymax = plt.ylim()
-            for dt, label in markers:
+            for m in markers:
+                if isinstance(m, dict):
+                    side = m.get("side", "long")
+                    dt = m.get("sell") if side == "short" else m.get("buy")
+                else:
+                    try:
+                        dt, _label = m
+                    except Exception:
+                        continue
+
+                if dt is None:
+                    continue
+
                 plt.axvline(dt, linestyle="--", alpha=0.35)
-                plt.text(dt, ymax, str(label), rotation=90, va="top", fontsize=8, alpha=0.7)
+                # подписи можно не рисовать, чтобы не захламлять
     except Exception:
         pass
 
@@ -325,6 +343,7 @@ def make_plot_image(
     plt.close()
     buf.seek(0)
     return buf
+
 
 
 def export_plot_pdf(history_df: pd.DataFrame, forecast_df: pd.DataFrame, ticker: str, out_path: str) -> None:

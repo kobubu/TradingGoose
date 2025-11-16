@@ -8,6 +8,7 @@ import logging
 import json
 import uuid
 import numpy as np
+from datetime import date as _date
 
 from dotenv import load_dotenv
 
@@ -103,6 +104,7 @@ from core.forecast import (
 from core.reminders import init_reminders, add_reminder, count_active, due_for_day, mark_sent
 from core import model_cache
 from core.favorites import get_favorites, add_favorite, remove_favorite
+from core import warmup 
 
 from ui import (
     HELP_TEXT,
@@ -143,6 +145,11 @@ from handlers_pro import (
 
 # Глобальный реестр "идущих" прогнозов: signature -> asyncio.Future
 INFLIGHT_FORECASTS: dict[str, asyncio.Future] = {}
+def _no_inflight() -> bool:
+    # True, если нет обучений в процессе
+    return not INFLIGHT_FORECASTS
+
+warmup.set_inflight_checker(_no_inflight)
 INFLIGHT_LOCK = asyncio.Lock()
 
 # --------------- Forecast pipeline ---------------
@@ -327,8 +334,7 @@ async def _get_shared_forecast(df, resolved_ticker: str):
     Возвращает тот же кортеж, что train_select_and_forecast:
       best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
     """
-    # считаем сигнатуру данных (у тебя _make_data_signature уже импортирован из core.forecast)
-    sig = _make_data_signature(df, resolved_ticker)
+    sig = _make_data_signature(df)
 
     async with INFLIGHT_LOCK:
         fut = INFLIGHT_FORECASTS.get(sig)
@@ -336,31 +342,33 @@ async def _get_shared_forecast(df, resolved_ticker: str):
             loop = asyncio.get_running_loop()
             fut = loop.create_future()
             INFLIGHT_FORECASTS[sig] = fut
-            owner = True   # этот запрос будет реально тренировать модели
+            owner = True
         else:
-            owner = False  # этот запрос просто подождёт результат
+            owner = False
 
     if owner:
         try:
-            # Тяжёлое обучение — в отдельном треде, чтобы не блочить event loop
+            # тяжёлое обучение в отдельном треде
             res = await asyncio.to_thread(
                 train_select_and_forecast,
                 df,
-                resolved_ticker
+                resolved_ticker,
             )
             fut.set_result(res)
+            return res
         except Exception as e:
             fut.set_exception(e)
+            # пробрасываем дальше, чтобы /forecast увидел ошибку и обработчик её залогировал
+            raise
         finally:
-            # убираем из реестра "в работе"
             async with INFLIGHT_LOCK:
                 INFLIGHT_FORECASTS.pop(sig, None)
     else:
-        # просто ждём, пока первый запрос досчитает
-        res = await fut
+        # просто ждём результат первого
+        return await fut
 
-    return res  # best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
+warmup.set_forecast_fn(_get_shared_forecast)
 
 def _pick_reminder_date(markers, fcst_df):
     try:
@@ -372,23 +380,49 @@ def _pick_reminder_date(markers, fcst_df):
 
 
 def _reminders_keyboard_from_markers(ticker: str, variant: str, markers, max_buttons: int = 6):
-    rows = []
-    cnt = 0
+    if not markers:
+        return None
+
+    # собираем даты входа по сделкам
+    entry_dates: list[_date] = []
     for m in (markers or []):
         try:
-            d = m.get("buy")
-            if not d:
+            if isinstance(m, dict):
+                side = m.get("side", "long")
+                if side == "short":
+                    dt = m.get("sell")   # вход в шорт — дата продажи
+                else:
+                    dt = m.get("buy")    # вход в лонг — дата покупки
+            else:
+                # старый формат маркеров (если вдруг попадётся)
+                dt = m[0]
+
+            if dt is None:
                 continue
-            d_iso = d.to_pydatetime().date().strftime("%Y-%m-%d")
-            rows.append([InlineKeyboardButton(
-                f"🔔 Напомнить {d_iso} в 09:00 МСК",
-                callback_data=f"rmd:{ticker}:{variant}:{d_iso}"
-            )])
-            cnt += 1
-            if cnt >= max_buttons:
-                break
+
+            d = dt.to_pydatetime().date()
+            entry_dates.append(d)
         except Exception:
             continue
+
+    if not entry_dates:
+        return None
+
+    # уникальные даты, отсортированные
+    uniq_dates = sorted(set(entry_dates))
+    # ограничиваем количеством кнопок
+    uniq_dates = uniq_dates[:max_buttons]
+
+    rows = []
+    for d in uniq_dates:
+        d_iso = d.strftime("%Y-%m-%d")
+        rows.append([
+            InlineKeyboardButton(
+                f"🔔 Напомнить {d_iso} в 09:00 МСК",
+                callback_data=f"rmd:{ticker}:{variant}:{d_iso}"
+            )
+        ])
+
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -422,6 +456,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    warmup.mark_user_activity()
     msg = update.effective_message
     u = update.effective_user
     logger.info("/forecast from user_id=%s args=%s", u.id if u else None, context.args)
@@ -721,6 +756,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Callback from user_id=%s data=%s", user_id, data)
 
     if data.startswith("forecast:"):
+        warmup.mark_user_activity()
         ticker = data.split(":", 1)[1].strip().upper()
         amount = DEFAULT_AMOUNT
 
@@ -904,6 +940,14 @@ def main():
         interval=timedelta(minutes=INTERVAL_MIN),
         first=10,
         name="payments_redeem",
+    )
+
+    WARMUP_INTERVAL_SEC = int(os.getenv("WARMUP_INTERVAL_SEC", "30"))
+    app.job_queue.run_repeating(
+        warmup.warmup_job,
+        interval=timedelta(seconds=WARMUP_INTERVAL_SEC),
+        first=60,   # через минуту после старта
+        name="warmup_models",
     )
 
     logger.info("Bot is starting polling…")

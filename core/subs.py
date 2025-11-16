@@ -15,6 +15,8 @@ DB_PATH = os.path.abspath(
 FREE_DAILY = int(os.getenv("FREE_DAILY", "3"))
 PRO_DAILY  = int(os.getenv("PRO_DAILY", "10"))
 
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
+
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # ---------------- DB helpers ----------------
@@ -94,7 +96,12 @@ def set_tier(user_id: int, tier: str, sub_until: int) -> None:
         )
 
 def get_limits(user_id: int) -> int:
+    # владелец бота — условно бесконечный лимит
+    if BOT_OWNER_ID and user_id == BOT_OWNER_ID:
+        return 10**9  # можно любое большое число
+
     return PRO_DAILY if is_pro(user_id) else FREE_DAILY
+
 
 def _maybe_reset_counter(user_id: int) -> None:
     now = int(time.time())
@@ -113,22 +120,32 @@ def _maybe_reset_counter(user_id: int) -> None:
             )
 
 def can_consume(user_id: int) -> bool:
+    # владелец бота всегда может
+    if BOT_OWNER_ID and user_id == BOT_OWNER_ID:
+        return True
+
     _maybe_reset_counter(user_id)
     with db() as conn:
         cnt, = conn.execute(
             "SELECT daily_count FROM users WHERE user_id=?",
-            (user_id,)
+            (user_id,),
         ).fetchone()
     return int(cnt) < get_limits(user_id)
 
+
 def consume_one(user_id: int) -> None:
+    # для владельца не трогаем счётчик вообще
+    if BOT_OWNER_ID and user_id == BOT_OWNER_ID:
+        return
+
     _maybe_reset_counter(user_id)
     with db() as conn:
         _ensure_user_row(conn, user_id)
         conn.execute(
             "UPDATE users SET daily_count = daily_count + 1 WHERE user_id=?",
-            (user_id,)
+            (user_id,),
         )
+
 
 # ---------------- Status / signal toggle ----------------
 def get_status(user_id: int) -> dict:

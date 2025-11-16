@@ -40,12 +40,38 @@ DISABLE_LSTM = os.getenv('DISABLE_LSTM', '0') == '1'
 DISABLE_NBEATS = os.getenv('DISABLE_NBEATS', '0') == '1' 
 
 
-# NBEATS hyperparams из .env
-NBEATS_BLOCKS = int(os.getenv("NBEATS_BLOCKS", "3"))
-NBEATS_WIDTH = int(os.getenv("NBEATS_WIDTH", "128"))
-NBEATS_HIDDEN = int(os.getenv("NBEATS_HIDDEN", "4"))
-NBEATS_EPOCHS = int(os.getenv("NBEATS_EPOCHS", "10"))
-NBEATS_BATCH = int(os.getenv("NBEATS_BATCH", "32"))
+def _int_list_from_env(name: str, default: str) -> list[int]:
+    """
+    Читает из ENV строку вида "60,90" и превращает в [60, 90].
+    Если переменная не задана или криво, берёт default.
+    """
+    raw = os.getenv(name, default)
+    items = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            items.append(int(part))
+        except ValueError:
+            continue
+    return items
+
+# === NBEATS конфиг ===
+DISABLE_NBEATS = os.getenv("DISABLE_NBEATS", "0") == "1"
+
+NBEATS_BLOCKS  = int(os.getenv("NBEATS_BLOCKS", "3"))
+NBEATS_WIDTH   = int(os.getenv("NBEATS_WIDTH", "128"))
+NBEATS_HIDDEN  = int(os.getenv("NBEATS_HIDDEN", "4"))
+NBEATS_EPOCHS  = int(os.getenv("NBEATS_EPOCHS", "10"))
+NBEATS_BATCH   = int(os.getenv("NBEATS_BATCH", "32"))
+
+# гриды для подбора
+NBEATS_WINDOW_GRID = _int_list_from_env("NBEATS_WINDOW_GRID", "60,90")
+NBEATS_BLOCKS_GRID = _int_list_from_env("NBEATS_BLOCKS_GRID", "2")
+NBEATS_WIDTH_GRID  = _int_list_from_env("NBEATS_WIDTH_GRID", "64,128")
+NBEATS_HIDDEN_GRID = _int_list_from_env("NBEATS_HIDDEN_GRID", "2")
+
 
 ART_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "artifacts")
 os.makedirs(ART_DIR, exist_ok=True)
