@@ -17,27 +17,60 @@ ART_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "artifacts")
 DATA_SOURCE = os.getenv("DATA_SOURCE", "auto").lower()
 
 os.makedirs(ART_DIR, exist_ok=True)
-
-# -------------------- NEW: топ-10 криптовалют и маппинг на тикеры Yahoo --------------------
-# BTC-USD, ETH-USD, BNB-USD, SOL-USD, XRP-USD, ADA-USD, DOGE-USD, TRX-USD, AVAX-USD, LTC-USD
+# -------------------- Крипта: маппинг на тикеры Yahoo --------------------
+# BTC-USD, ETH-USD, BNB-USD, SOL-USD, ... — минимум 40 штук
 CRYPTO_MAP: Dict[str, str] = {
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
-    "BNB": "BNB-USD",
-    "SOL": "SOL-USD",
-    "XRP": "XRP-USD",
-    "ADA": "ADA-USD",
+    # Топ-10, как было
+    "BTC":  "BTC-USD",
+    "ETH":  "ETH-USD",
+    "BNB":  "BNB-USD",
+    "SOL":  "SOL-USD",
+    "XRP":  "XRP-USD",
+    "ADA":  "ADA-USD",
     "DOGE": "DOGE-USD",
-    "TRX": "TRX-USD",
+    "TRX":  "TRX-USD",
     "AVAX": "AVAX-USD",
-    "LTC": "LTC-USD",
+    "LTC":  "LTC-USD",
+
+    # Добавляем ещё ~30 ликвидных монет
+    "TON":  "TON-USD",
+    "LINK": "LINK-USD",
+    "MATIC": "MATIC-USD",
+    "DOT":  "DOT-USD",
+    "BCH":  "BCH-USD",
+    "XLM":  "XLM-USD",
+    "XMR":  "XMR-USD",
+    "ETC":  "ETC-USD",
+    "ATOM": "ATOM-USD",
+    "NEAR": "NEAR-USD",
+    "HBAR": "HBAR-USD",
+    "ALGO": "ALGO-USD",
+    "APT":  "APT-USD",
+    "ARB":  "ARB-USD",
+    "OP":   "OP-USD",
+    "SAND": "SAND-USD",
+    "AXS":  "AXS-USD",
+    "RUNE": "RUNE-USD",
+    "MKR":  "MKR-USD",
+    "LDO":  "LDO-USD",
+    "STX":  "STX-USD",
+    "IMX":  "IMX-USD",
+    "SEI":  "SEI-USD",
+    "PYTH": "PYTH-USD",
+    "WIF":  "WIF-USD",
+    "PEPE": "PEPE-USD",
+    "INJ":  "INJ-USD",
+    "FIL":  "FIL-USD",
+    "GMX":  "GMX-USD",
+    "ORDI": "ORDI-USD",
 }
 # Удобный порядок для кнопок в боте
 MAIN_CRYPTO: List[str] = list(CRYPTO_MAP.keys())
 # -------------------------------------------------------------------------------------------
 
-# -------------------- НОВОЕ: основные форекс-пары (Yahoo: '=X') --------------------
+# -------------------- Форекс-пары (Yahoo: '=X') --------------------
 FOREX_MAP: Dict[str, str] = {
+    # Мажоры
     "EURUSD": "EURUSD=X",
     "GBPUSD": "GBPUSD=X",
     "USDJPY": "USDJPY=X",
@@ -45,12 +78,30 @@ FOREX_MAP: Dict[str, str] = {
     "USDCAD": "USDCAD=X",
     "AUDUSD": "AUDUSD=X",
     "NZDUSD": "NZDUSD=X",
+
+    # EUR-кроссы
     "EURGBP": "EURGBP=X",
     "EURJPY": "EURJPY=X",
+    "EURCHF": "EURCHF=X",
+    "EURAUD": "EURAUD=X",
+    "EURNZD": "EURNZD=X",
+    "EURCAD": "EURCAD=X",
+
+    # GBP-кроссы
     "GBPJPY": "GBPJPY=X",
+    "GBPCHF": "GBPCHF=X",
+    "GBPAUD": "GBPAUD=X",
+    "GBPCAD": "GBPCAD=X",
+
+    # Прочие кроссы / сырьевые
+    "AUDJPY": "AUDJPY=X",
+    "CADJPY": "CADJPY=X",
+    "CHFJPY": "CHFJPY=X",
+    "AUDCAD": "AUDCAD=X",
+    "AUDNZD": "AUDNZD=X",
 }
 MAIN_FOREX: List[str] = list(FOREX_MAP.keys())
-# -------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 
 def _now_utc_date() -> datetime.date:

@@ -486,7 +486,7 @@ def select_and_fit_with_candidates(
         if best_lstm is not None:
             candidates.append(best_lstm)
 
-     # N-BEATS (если не отключён)
+        # N-BEATS (если не отключён)
     if not DISABLE_NBEATS:
         best_nbeats: Optional[ModelResult] = None
         for win in (60, 90, 120):
@@ -507,9 +507,39 @@ def select_and_fit_with_candidates(
                         extra={"type": "nbeats", "window": win},
                     )
                     logger.debug("NBEATS candidate window=%d rmse=%.4f", win, rmse)
-                    ...
+
+                    if save_plots:
+                        tag = (eval_tag or "series").upper()
+                        base = f"eval_{tag}_nbeats_win{win}"
+                        _save_eval_plot(
+                            y_index,
+                            y_true,
+                            nbeats_preds,
+                            f"{tag} — NBEATS(win={win})  RMSE={rmse:.4f}",
+                            os.path.join(artifacts_dir, f"{base}.png"),
+                        )
+                        _save_eval_json(
+                            {
+                                "model": "NBEATS",
+                                "window": win,
+                                "rmse": float(rmse),
+                                "mape": _safe_mape(y_true, nbeats_preds),
+                                "val_steps": val_steps,
+                                "horizon": horizon,
+                                "blocks": NBEATS_BLOCKS,
+                                "width": NBEATS_WIDTH,
+                                "hidden": NBEATS_HIDDEN,
+                            },
+                            os.path.join(artifacts_dir, f"{base}.json"),
+                        )
+
+                    # выбираем лучшую NBEATS по RMSE
+                    if (best_nbeats is None) or (cand.rmse < best_nbeats.rmse):
+                        best_nbeats = cand
+
             except Exception:
                 logger.exception("NBEATS candidate failed for window=%d", win)
+
         if best_nbeats is not None:
             candidates.append(best_nbeats)
 

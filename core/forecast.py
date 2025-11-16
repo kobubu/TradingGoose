@@ -117,26 +117,27 @@ def train_select_and_forecast(
                 best_dict = {"name": fmeta.get("best_name", "cached_best")}
                 metrics = fmeta.get("metrics", {"rmse": None, "mape": None})
                 return best_dict, metrics, fb, fa, ft
-            # иначе просто пересчитаем и перезапишем
             else:
+                # иначе просто пересчитаем и перезапишем
                 print("DEBUG: forecasts cache STALE → recompute & overwrite")
 
-    # ---------- Далее старая логика: пытаемся использовать кэш модели для "best" ----------
-    best_dict = {"name": None}
-    metrics = {"rmse": None, "mape": None}
-    fcst_best_df = None
-    fcst_avg_all_df = None
-    fcst_avg_top3_df = None
+    # ---------- Далее логика: пытаемся использовать кэш модели для "best" ----------
+    best_dict: Dict[str, Optional[str]] = {"name": None}
+    metrics: Dict[str, Optional[float]] = {"rmse": None, "mape": None}
+    fcst_best_df: Optional[pd.DataFrame] = None
+    fcst_avg_all_df: Optional[pd.DataFrame] = None
+    fcst_avg_top3_df: Optional[pd.DataFrame] = None
 
     def _save_three(best_name: str, metrics_obj: Dict[str, any], fb, fa, ft):
+        """Сохранить три варианта прогноза + метаданные, включая тикер."""
         meta = {
             "best_name": best_name,
             "metrics": metrics_obj,
             "trained_at": int(time.time()),
             "model_version": MODEL_VERSION,
             "data_sig": data_sig,
+            "ticker": (ticker or "N/A").upper(),
         }
-
         model_cache.save_forecasts(fc_key, fb, fa, ft, meta)
 
     # --- sklearn best
@@ -201,13 +202,14 @@ def train_select_and_forecast(
             val_steps=val_steps,
             horizon=WF_HORIZON,
             eval_tag=ticker,
-            save_plots=False
+            save_plots=False,
         )
         fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(y, candidates, future_idx)
         if fcst_avg_all_df.empty:
             fcst_avg_all_df = fcst_best_df.copy()
         if fcst_avg_top3_df.empty:
             fcst_avg_top3_df = fcst_best_df.copy()
+
         _save_three(best_dict["name"] or "cached_best", metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df)
         return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
@@ -259,8 +261,12 @@ def train_select_and_forecast(
             elif best.extra.get("type") == "sarimax":
                 order, seas, trend, _ = best.model_obj
                 m = sm.tsa.SARIMAX(
-                    y, order=order, seasonal_order=seas, trend=trend,
-                    enforce_stationarity=False, enforce_invertibility=False
+                    y,
+                    order=order,
+                    seasonal_order=seas,
+                    trend=trend,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
                 )
                 res = m.fit(disp=False)
                 meta_model["extra"] = {"order": order, "seasonal_order": seas, "trend": trend}
@@ -273,16 +279,10 @@ def train_select_and_forecast(
                     model, (mu, sigma), window = mo
                 meta_model["extra"] = {"mu": float(mu), "sigma": float(sigma), "window": int(window)}
                 model_cache.save_tf_model(model_key, model, meta_model)
-            # сохранить ТРИ прогноза (новинка)
-            model_cache.save_forecasts(fc_key, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df,
-                {
-                    "best_name": best.name,
-                    "metrics": metrics,
-                    "trained_at": int(time.time()),
-                    "model_version": MODEL_VERSION,
-                    "data_sig": data_sig,
-                }
-            )
+
+            # сохранить ТРИ прогноза (через наш helper, с тикером)
+            _save_three(best.name, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df)
+
     except Exception as e:
         print(f"[ERR] save_forecasts failed: {e}")
         raise

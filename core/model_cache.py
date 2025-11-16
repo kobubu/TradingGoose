@@ -256,5 +256,48 @@ def load_forecasts(key: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFr
     meta  = json.load(open(p_meta, encoding="utf8"))
     return best, all_, top3, meta
 
+def load_latest_forecasts_for_ticker(ticker: str):
+    """
+    Найти последний (по trained_at) набор forecast'ов для данного тикера.
+    Возвращает (fb, fa, ft, meta) или (None, None, None, None), если ничего не найдено.
+    """
+    ticker = (ticker or "").upper()
+    latest_key = None
+    latest_meta = None
+    latest_ts = 0
+
+    if not MODEL_ROOT.exists():
+        return None, None, None, None
+
+    for d in MODEL_ROOT.iterdir():
+        if not d.is_dir():
+            continue
+        meta_path = d / _F_META
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.load(open(meta_path, encoding="utf8"))
+        except Exception:
+            continue
+
+        if meta.get("ticker") != ticker:
+            continue
+
+        trained_at = int(meta.get("trained_at", 0))
+        if trained_at > latest_ts:
+            latest_ts = trained_at
+            latest_key = d.name
+            latest_meta = meta
+
+    if not latest_key:
+        return None, None, None, None
+
+    # используем уже готовый load_forecasts
+    fb, fa, ft, _ = load_forecasts(latest_key)
+    if fb is None or fa is None or ft is None:
+        return None, None, None, None
+
+    return fb, fa, ft, latest_meta
+
 
 _startup_cleanup()
