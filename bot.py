@@ -141,6 +141,9 @@ from handlers_pro import (
 )
 
 
+# Глобальный реестр "идущих" прогнозов: signature -> asyncio.Future
+INFLIGHT_FORECASTS: dict[str, asyncio.Future] = {}
+INFLIGHT_LOCK = asyncio.Lock()
 
 # --------------- Forecast pipeline ---------------
 
@@ -163,7 +166,9 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
         logger.debug("History loaded: ticker=%s len=%d last_dt=%s", resolved, len(df), df.index[-1])
 
         # 2) три прогноза
-        best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df = train_select_and_forecast(df, ticker=resolved)
+        # общий расчёт для всех конкурентных запросов к этому df/ticker
+        best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df = await _get_shared_forecast(df, resolved)
+
         logger.info(
             "Models trained/loaded: ticker=%s best=%s rmse=%.4f",
             resolved, best["name"], metrics.get("rmse") if metrics else -1.0
@@ -313,6 +318,48 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
     except Exception:
         logger.exception("Error in _run_forecast_for: ticker=%s user_id=%s", ticker, user_id)
         await reply_text_fn("Ошибка при построении прогноза.", reply_markup=category_keyboard())
+
+async def _get_shared_forecast(df, resolved_ticker: str):
+    """
+    Гарантирует, что для одного и того же df/ticker одновременно
+    считается только ОДИН train_select_and_forecast.
+
+    Возвращает тот же кортеж, что train_select_and_forecast:
+      best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
+    """
+    # считаем сигнатуру данных (у тебя _make_data_signature уже импортирован из core.forecast)
+    sig = _make_data_signature(df, resolved_ticker)
+
+    async with INFLIGHT_LOCK:
+        fut = INFLIGHT_FORECASTS.get(sig)
+        if fut is None:
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            INFLIGHT_FORECASTS[sig] = fut
+            owner = True   # этот запрос будет реально тренировать модели
+        else:
+            owner = False  # этот запрос просто подождёт результат
+
+    if owner:
+        try:
+            # Тяжёлое обучение — в отдельном треде, чтобы не блочить event loop
+            res = await asyncio.to_thread(
+                train_select_and_forecast,
+                df,
+                resolved_ticker
+            )
+            fut.set_result(res)
+        except Exception as e:
+            fut.set_exception(e)
+        finally:
+            # убираем из реестра "в работе"
+            async with INFLIGHT_LOCK:
+                INFLIGHT_FORECASTS.pop(sig, None)
+    else:
+        # просто ждём, пока первый запрос досчитает
+        res = await fut
+
+    return res  # best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
 
 def _pick_reminder_date(markers, fcst_df):
@@ -791,8 +838,6 @@ async def post_init(application):
         BotCommand("help", "Помощь по боту"),
     ])
 
-
-# --------------- Entrypoint ---------------
 
 # --------------- Entrypoint ---------------
 
