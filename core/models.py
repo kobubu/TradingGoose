@@ -486,62 +486,82 @@ def select_and_fit_with_candidates(
         if best_lstm is not None:
             candidates.append(best_lstm)
 
-        # N-BEATS (если не отключён)
+        # N-BEATS (если не отключён) — полноценный grid search
     if not DISABLE_NBEATS:
         best_nbeats: Optional[ModelResult] = None
-        for win in (60, 90, 120):
-            try:
-                nbeats_preds, nbeats_obj = _wf_nbeats(
-                    y,
-                    val_steps=val_steps,
-                    window=win,
-                    horizon=horizon,
-                )
-                if _valid_preds(nbeats_preds, val_steps):
-                    rmse = mean_squared_error(y_true, nbeats_preds, squared=False)
-                    cand = ModelResult(
-                        name=f"NBEATS(window={win})",
-                        yhat_val=nbeats_preds,
-                        rmse=float(rmse),
-                        model_obj=nbeats_obj,  # (window, horizon, blocks, width, hidden)
-                        extra={"type": "nbeats", "window": win},
-                    )
-                    logger.debug("NBEATS candidate window=%d rmse=%.4f", win, rmse)
 
-                    if save_plots:
-                        tag = (eval_tag or "series").upper()
-                        base = f"eval_{tag}_nbeats_win{win}"
-                        _save_eval_plot(
-                            y_index,
-                            y_true,
-                            nbeats_preds,
-                            f"{tag} — NBEATS(win={win})  RMSE={rmse:.4f}",
-                            os.path.join(artifacts_dir, f"{base}.png"),
-                        )
-                        _save_eval_json(
-                            {
-                                "model": "NBEATS",
-                                "window": win,
-                                "rmse": float(rmse),
-                                "mape": _safe_mape(y_true, nbeats_preds),
-                                "val_steps": val_steps,
-                                "horizon": horizon,
-                                "blocks": NBEATS_BLOCKS,
-                                "width": NBEATS_WIDTH,
-                                "hidden": NBEATS_HIDDEN,
-                            },
-                            os.path.join(artifacts_dir, f"{base}.json"),
-                        )
+        for win in NBEATS_WINDOW_GRID:
+            for n_blocks in NBEATS_BLOCKS_GRID:
+                for width in NBEATS_WIDTH_GRID:
+                    for n_hidden in NBEATS_HIDDEN_GRID:
+                        try:
+                            nbeats_preds, nbeats_obj = _wf_nbeats(
+                                y,
+                                val_steps=val_steps,
+                                window=win,
+                                horizon=horizon,
+                                n_blocks=n_blocks,
+                                width=width,
+                                n_hidden=n_hidden,
+                            )
+                            if _valid_preds(nbeats_preds, val_steps):
+                                rmse = mean_squared_error(y_true, nbeats_preds, squared=False)
+                                cand = ModelResult(
+                                    name=f"NBEATS(win={win},B={n_blocks},W={width},H={n_hidden})",
+                                    yhat_val=nbeats_preds,
+                                    rmse=float(rmse),
+                                    model_obj=nbeats_obj,  # (window, horizon, blocks, width, hidden)
+                                    extra={
+                                        "type": "nbeats",
+                                        "window": win,
+                                        "blocks": n_blocks,
+                                        "width": width,
+                                        "hidden": n_hidden,
+                                    },
+                                )
+                                logger.debug(
+                                    "NBEATS candidate win=%d blocks=%d width=%d hidden=%d rmse=%.4f",
+                                    win, n_blocks, width, n_hidden, rmse,
+                                )
 
-                    # выбираем лучшую NBEATS по RMSE
-                    if (best_nbeats is None) or (cand.rmse < best_nbeats.rmse):
-                        best_nbeats = cand
+                                if save_plots:
+                                    tag = (eval_tag or "series").upper()
+                                    base = f"eval_{tag}_nbeats_w{win}_B{n_blocks}_W{width}_H{n_hidden}"
+                                    _save_eval_plot(
+                                        y_index,
+                                        y_true,
+                                        nbeats_preds,
+                                        f"{tag} — NBEATS(w={win},B={n_blocks},W={width},H={n_hidden})  RMSE={rmse:.4f}",
+                                        os.path.join(artifacts_dir, f"{base}.png"),
+                                    )
+                                    _save_eval_json(
+                                        {
+                                            "model": "NBEATS",
+                                            "window": win,
+                                            "blocks": n_blocks,
+                                            "width": width,
+                                            "hidden": n_hidden,
+                                            "rmse": float(rmse),
+                                            "mape": _safe_mape(y_true, nbeats_preds),
+                                            "val_steps": val_steps,
+                                            "horizon": horizon,
+                                        },
+                                        os.path.join(artifacts_dir, f"{base}.json"),
+                                    )
 
-            except Exception:
-                logger.exception("NBEATS candidate failed for window=%d", win)
+                                # выбираем лучшую NBEATS по RMSE
+                                if (best_nbeats is None) or (cand.rmse < best_nbeats.rmse):
+                                    best_nbeats = cand
+
+                        except Exception:
+                            logger.exception(
+                                "NBEATS candidate failed for win=%d blocks=%d width=%d hidden=%d",
+                                win, n_blocks, width, n_hidden,
+                            )
 
         if best_nbeats is not None:
             candidates.append(best_nbeats)
+
 
     try:
         logger.info(
@@ -859,17 +879,29 @@ def _wf_nbeats(
     val_steps: int,
     window: int = 60,
     horizon: int = 1,
+    n_blocks: Optional[int] = None,
+    width: Optional[int] = None,
+    n_hidden: Optional[int] = None,
+    epochs: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> Tuple[np.ndarray, Any]:
     """
     Walk-forward валидация для упрощенного N-BEATS:
     - вход: окно цен размером `window`
     - выход: forecast_length = horizon
     - для каждой точки в валидации переобучаем модель на train-части (как LSTM).
-    Гиперпараметры берём из .env (NBEATS_BLOCKS, NBEATS_WIDTH, ...).
+    Гиперпараметры можно задать либо явно, либо будут взяты из .env.
     """
     p = y.astype(float).values
     if len(p) < window + val_steps + 5:
         raise ValueError("Слишком короткий ряд для N-BEATS.")
+
+    # подставляем значения по умолчанию из .env, если не переданы явно
+    n_blocks = n_blocks or NBEATS_BLOCKS
+    width = width or NBEATS_WIDTH
+    n_hidden = n_hidden or NBEATS_HIDDEN
+    epochs = epochs or NBEATS_EPOCHS
+    batch_size = batch_size or NBEATS_BATCH
 
     start = len(p) - val_steps
     n_valid = min(val_steps, max(0, len(p) - (start + horizon - 1)))
@@ -908,18 +940,18 @@ def _wf_nbeats(
             model = _build_nbeats_model(
                 backcast_length=window,
                 forecast_length=horizon,
-                n_blocks=NBEATS_BLOCKS,
-                width=NBEATS_WIDTH,
-                n_hidden=NBEATS_HIDDEN,
+                n_blocks=n_blocks,
+                width=width,
+                n_hidden=n_hidden,
             )
-            base_epochs = NBEATS_EPOCHS
+            base_epochs = epochs
         else:
-            base_epochs = max(4, NBEATS_EPOCHS // 2)
+            base_epochs = max(4, epochs // 2)
 
         model.fit(
             X_norm, yy,
             epochs=base_epochs,
-            batch_size=NBEATS_BATCH,
+            batch_size=batch_size,
             verbose=0,
         )
 
@@ -936,5 +968,5 @@ def _wf_nbeats(
     preds = _pad_to_val_steps(preds, val_steps, fill)
 
     # сохраняем параметры, с которыми тренировали (для refit)
-    nbeats_obj = (window, horizon, NBEATS_BLOCKS, NBEATS_WIDTH, NBEATS_HIDDEN)
+    nbeats_obj = (window, horizon, n_blocks, width, n_hidden)
     return preds, nbeats_obj
