@@ -7,6 +7,12 @@ from datetime import time as dtime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 import json
+from telegram import BotCommand
+
+from telegram import InlineQueryResultArticle, InputTextMessageContent
+from telegram.ext import InlineQueryHandler
+import uuid
+
 
 from dotenv import load_dotenv
 
@@ -16,6 +22,8 @@ load_dotenv()
 # ---------- LOGGING ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FILE = os.getenv("LOG_FILE", os.path.join("artifacts", "bot.log"))
+FAV_FILE = os.path.join("artifacts", "favorites.json")
+
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
@@ -139,19 +147,26 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("ℹ️ Статус", callback_data="menu:status"),
         ],
         [
-            InlineKeyboardButton("❓ Все команды", callback_data="menu:help")
+            InlineKeyboardButton("❓ Все команды", callback_data="menu:help"),
+            InlineKeyboardButton("⭐ Избранное", callback_data="menu:fav")
         ]
     ])
 
 
 def _category_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("📈 Акции", callback_data="menu:stocks"),
-            InlineKeyboardButton("₿ Крипта", callback_data="menu:crypto"),
-            InlineKeyboardButton("💱 Форекс", callback_data="menu:forex"),
-        ]]
+        [
+            [
+                InlineKeyboardButton("📈 Акции", callback_data="menu:stocks"),
+                InlineKeyboardButton("₿ Крипта", callback_data="menu:crypto"),
+                InlineKeyboardButton("💱 Форекс", callback_data="menu:forex"),
+            ],
+            [
+                InlineKeyboardButton("⭐ Избранное", callback_data="menu:fav"),
+            ],
+        ]
     )
+
 
 def _pro_cta_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -509,6 +524,43 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Error in /forecast handler for user_id=%s", u.id if u else None)
         await msg.reply_text("Ошибка при обработке команды /forecast.", reply_markup=_category_keyboard())
 
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Inline-режим: @YourBot AAPL -> подсказываем тикеры.
+    При выборе варианта в чат отправится текст вида "/forecast AAPL".
+    """
+    query = update.inline_query
+    if not query:
+        return
+
+    q = (query.query or "").strip().upper()
+
+    # Если пользователь ничего не ввёл — покажем несколько популярных тикеров
+    if not q:
+        candidates = SUPPORTED_TICKERS[:6]  # первые 6 акций
+    else:
+        # Ищем по всем спискам тикеров
+        all_tickers = list(dict.fromkeys(
+            list(SUPPORTED_TICKERS) + list(SUPPORTED_CRYPTO) + list(SUPPORTED_FOREX)
+        ))
+        candidates = [t for t in all_tickers if q in t][:10]  # максимум 10 совпадений
+
+    results = []
+    for t in candidates:
+        # Текст, который реально отправится в чат при выборе
+        msg_text = f"/forecast {t}"
+
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title=f"{t} — построить прогноз",
+                description=f"Отправить команду: {msg_text}",
+                input_message_content=InputTextMessageContent(msg_text),
+            )
+        )
+
+    await query.answer(results, cache_time=60, is_personal=True)
+
 
 async def stocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -629,6 +681,9 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if kind == "help":
             await query.message.reply_text(HELP_TEXT, reply_markup=_main_menu_keyboard())
+            return
+        if kind == "fav":
+            await fav_list_cmd(update, context)
             return
 
     if data.startswith("rmd:") or data.startswith("remind:"):
@@ -1053,6 +1108,54 @@ async def debug_payments_reset_cmd(update: Update, context: ContextTypes.DEFAULT
     reset_payments_state()
     await msg.reply_text("payments_state сброшен (last_lt=0). Следующий проход заново просканирует историю.")
 
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    logger.info("/profile from user_id=%s", u.id if u else None)
+    msg = update.effective_message
+
+    st = get_status(u.id)
+    try:
+        active_rmd = count_active(u.id)
+    except Exception:
+        logger.exception("count_active failed for user_id=%s", u.id)
+        active_rmd = 0
+
+    # Signal-режим
+    mode = get_signal_cats(u.id)
+    lst = get_signal_list(u.id)
+
+    mode_h = {
+        "all": "все категории",
+        "stocks": "только акции",
+        "crypto": "только крипта",
+        "forex": "только форекс",
+        "custom": "выбранные тикеры",
+        None: "по умолчанию (акции+крипта+форекс)",
+    }.get(mode, str(mode))
+
+    if mode == "custom":
+        mode_h += f" ({', '.join(lst) if lst else 'не задано'})"
+
+    rmd_limit = 100 if st.get("tier") == "pro" else 1
+
+    text = (
+        f"👤 Профиль пользователя\n"
+        f"ID: `{u.id}`\n\n"
+        f"Тариф: *{'PRO' if st['tier'] == 'pro' else 'FREE'}*\n"
+        f"Подписка до: {_fmt_until(st['sub_until'])}\n\n"
+        f"🔢 Прогнозы сегодня: {st['daily_count']} / {get_limits(u.id)}\n"
+        f"🔔 Напоминаний активных: {active_rmd} / {rmd_limit}\n\n"
+        f"📡 Signal Mode: {'ON ✅' if st['signal_enabled'] else 'OFF ❌'}\n"
+        f"Режим сигналов: {mode_h}\n\n"
+        f"Полезные команды:\n"
+        f"/status — краткий статус\n"
+        f"/pro — про подписку\n"
+        f"/buy — оплата\n"
+        f"/signal_on / /signal_off — сигналы\n"
+    )
+
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=_category_keyboard())
+
 
 async def debug_models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -1086,6 +1189,144 @@ async def debug_models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text(f"```text\n{text}\n```", parse_mode="Markdown")
 
+# ---------------- Favorites storage ----------------
+
+def _load_favorites():
+    if not os.path.exists(FAV_FILE):
+        return {}
+    try:
+        with open(FAV_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.exception("Failed to load favorites file")
+        return {}
+
+
+def _save_favorites(data):
+    try:
+        tmp = FAV_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, FAV_FILE)
+    except Exception:
+        logger.exception("Failed to save favorites file")
+
+
+def get_favorites(user_id: int):
+    data = _load_favorites()
+    return data.get(str(user_id), [])
+
+
+def add_favorite(user_id: int, ticker: str):
+    data = _load_favorites()
+    key = str(user_id)
+    favs = data.get(key, [])
+    if ticker not in favs:
+        favs.append(ticker)
+        data[key] = favs
+        _save_favorites(data)
+    return favs
+
+
+def remove_favorite(user_id: int, ticker: str):
+    data = _load_favorites()
+    key = str(user_id)
+    favs = data.get(key, [])
+    if ticker in favs:
+        favs.remove(ticker)
+        data[key] = favs
+        _save_favorites(data)
+    return favs
+
+async def fav_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    msg = update.effective_message
+    logger.info("/fav_add from user_id=%s args=%s", u.id if u else None, context.args)
+
+    if not u:
+        await msg.reply_text("Не удалось определить пользователя.")
+        return
+
+    if not context.args:
+        await msg.reply_text("Использование: /fav_add <TICKER>")
+        return
+
+    user_ticker = context.args[0].upper().strip()
+    # Можно сразу прогнать через resolve_user_ticker, чтобы нормализовать:
+    try:
+        resolved = resolve_user_ticker(user_ticker)
+    except Exception:
+        resolved = user_ticker
+
+    favs = add_favorite(u.id, resolved)
+    await msg.reply_text(
+        f"Тикер {resolved} добавлен в избранное.\n"
+        f"Текущее избранное: {', '.join(favs)}"
+    )
+
+
+async def fav_remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    msg = update.effective_message
+    logger.info("/fav_remove from user_id=%s args=%s", u.id if u else None, context.args)
+
+    if not u:
+        await msg.reply_text("Не удалось определить пользователя.")
+        return
+
+    if not context.args:
+        await msg.reply_text("Использование: /fav_remove <TICKER>")
+        return
+
+    user_ticker = context.args[0].upper().strip()
+    try:
+        resolved = resolve_user_ticker(user_ticker)
+    except Exception:
+        resolved = user_ticker
+
+    favs = remove_favorite(u.id, resolved)
+    await msg.reply_text(
+        f"Тикер {resolved} удалён из избранного.\n"
+        f"Текущее избранное: {', '.join(favs) if favs else 'пусто'}"
+    )
+
+
+async def fav_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    msg = update.effective_message
+    logger.info("/fav from user_id=%s", u.id if u else None)
+
+    if not u:
+        await msg.reply_text("Не удалось определить пользователя.")
+        return
+
+    favs = get_favorites(u.id)
+    if not favs:
+        await msg.reply_text(
+            "У вас пока нет избранных тикеров.\n"
+            "Добавьте через /fav_add <TICKER>.\n\n"
+            "Например: /fav_add AAPL",
+            reply_markup=_category_keyboard()
+        )
+        return
+
+    rows = _build_list_rows(favs, per_row=3)
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:root")])
+
+    await msg.reply_text(
+        "⭐ Ваши избранные тикеры:",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+
+async def post_init(application):
+    await application.bot.set_my_commands([
+        BotCommand("buy", "Оплата Pro-подписки"),
+        BotCommand("pro", "Pro-подписка и Signal Mode"),
+        BotCommand("status", "Ваш тариф и лимиты"),
+        BotCommand("help", "Помощь по боту"),
+    ])
 
 # --------------- Entrypoint ---------------
 
@@ -1097,11 +1338,12 @@ def main():
     init_db()
     init_reminders()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     logger.info("Telegram application built")
 
     # хендлеры
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("forecast", forecast))
     app.add_handler(CommandHandler("stocks", stocks))
     app.add_handler(CommandHandler("crypto", crypto))
@@ -1123,7 +1365,15 @@ def main():
     app.add_handler(CommandHandler("debug_payments", debug_payments_cmd))
     app.add_handler(CommandHandler("debug_payments_reset", debug_payments_reset_cmd))
     app.add_handler(CommandHandler("debug_models", debug_models_cmd))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
+    app.add_handler(CommandHandler("profile", profile_cmd))
+    app.add_handler(CommandHandler("fav_add", fav_add_cmd))
+    app.add_handler(CommandHandler("fav_remove", fav_remove_cmd))
+    app.add_handler(CommandHandler("fav", fav_list_cmd))
+    app.add_handler(CommandHandler("favorites", fav_list_cmd))
+
     app.add_error_handler(error_handler)
+    
 
     # ежедневные «сигналы» через JobQueue (09:00 по МСК)
     app.job_queue.run_daily(
