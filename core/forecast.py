@@ -14,15 +14,25 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
 import statsmodels.api as sm
 
+import csv
+from pathlib import Path
+
 from . import model_cache
 from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 
 logger = logging.getLogger(__name__)
+models_logger = logging.getLogger("models") 
 
 MODEL_VERSION = "v1"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
+# Куда складываем статистику по моделям
+STATS_PATH = (
+    Path(__file__).resolve().parent.parent / "artifacts" / "models_stats.csv"
+)
 
+# Логгер для моделей (тот же, что настраиваешь в bot.py)
+models_logger = logging.getLogger("models")
 
 # ---------- Data signature для кэша ----------
 
@@ -163,6 +173,86 @@ def _is_fresh(meta: Dict[str, Any], ttl: int) -> bool:
     except Exception:
         return False
 
+def _make_config_id(model_name: str, extra: Optional[dict]) -> str:
+    """
+    Стабильный идентификатор конфигурации модели.
+    Один и тот же набор гиперпараметров -> один config_id.
+    """
+    try:
+        payload = {
+            "name": model_name,
+            "extra": extra or {},
+            "model_version": MODEL_VERSION,
+        }
+        s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha1(s).hexdigest()
+    except Exception:
+        # в крайнем случае хоть что-то
+        return f"legacy::{model_name}"
+
+def _append_model_stats(
+    ticker: Optional[str],
+    model_name: str,
+    model_type: Optional[str],
+    metrics: Dict[str, Optional[float]],
+    data_sig: str,
+    n_points: int,
+    start_dt: pd.Timestamp,
+    end_dt: pd.Timestamp,
+    val_steps: int,
+    extra: Optional[dict],
+    source: str = "train",
+) -> None:
+    """
+    Пишет одну строку в artifacts/models_stats.csv:
+    какие данные, какая модель победила, с какими метриками.
+    """
+    try:
+        STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        rmse = metrics.get("rmse")
+        mape = metrics.get("mape")
+
+        config_id = _make_config_id(model_name, extra)   # 👈 НОВОЕ
+
+        row = {
+            "ts": int(time.time()),
+            "ts_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+            "ticker": (ticker or "N/A").upper(),
+            "model_name": model_name,
+            "model_type": model_type or "",
+            "config_id": config_id,                    # 👈 НОВОЕ поле
+            "rmse": float(rmse) if rmse is not None else "",
+            "mape": float(mape) if mape is not None else "",
+            "val_steps": int(val_steps),
+            "n_points": int(n_points),
+            "start_date": pd.to_datetime(start_dt).date().isoformat(),
+            "end_date": pd.to_datetime(end_dt).date().isoformat(),
+            "data_sig": data_sig,
+            "source": source,  # "train" или "cache"
+        }
+
+        file_exists = STATS_PATH.exists()
+        with STATS_PATH.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+        models_logger.info(
+            "Model stats: %s cfg=%s for %s type=%s rmse=%.4f source=%s",
+            model_name,
+            config_id,
+            row["ticker"],
+            model_type or "",
+            float(rmse) if rmse is not None else float("nan"),
+            source,
+        )
+
+    except Exception:
+        logger.exception("Failed to append model stats")
+
+
 
 # ---------- Основной пайплайн ----------
 
@@ -211,6 +301,12 @@ def train_select_and_forecast(
                 logger.info("Forecasts cache HIT (fresh) for %s", ticker)
                 best_dict = {"name": fmeta.get("best_name", "cached_best")}
                 metrics = fmeta.get("metrics", {"rmse": None, "mape": None})
+                models_logger.info(
+                    "Using cached FORECASTS for %s: best=%s rmse=%.4f",
+                    (ticker or "N/A"),
+                    fmeta.get("best_name", "cached_best"),
+                    float((fmeta.get("metrics") or {}).get("rmse") or float("nan")),
+                )
                 return best_dict, metrics, fb, fa, ft
             else:
                 logger.info("Forecasts cache STALE for %s → recompute", ticker)
@@ -255,6 +351,12 @@ def train_select_and_forecast(
                     )
                     best_dict["name"] = skl_meta.get("name", "cached_sklearn")
                     metrics = skl_meta.get("metrics", {"rmse": None, "mape": None})
+                    models_logger.info(
+                        "Using cached SKLEARN model=%s for %s rmse=%.4f",
+                        best_dict["name"],
+                        (ticker or "N/A"),
+                        float(metrics.get("rmse") or float("nan")),
+                    )
                     logger.info("Loaded cached sklearn model for %s", ticker)
             except Exception:
                 logger.exception("Error using cached sklearn model for %s", ticker)
@@ -269,6 +371,12 @@ def train_select_and_forecast(
                 best_dict["name"] = sm_meta.get("name", "cached_sarimax")
                 metrics = sm_meta.get("metrics", {"rmse": None, "mape": None})
                 logger.info("Loaded cached SARIMAX model for %s", ticker)
+                models_logger.info(
+                    "Using cached SARIMAX model=%s for %s rmse=%.4f",
+                    best_dict["name"],
+                    (ticker or "N/A"),
+                    float(metrics.get("rmse") or float("nan")),
+                )
             except Exception:
                 logger.exception("Error using cached SARIMAX model for %s", ticker)
 
@@ -299,6 +407,12 @@ def train_select_and_forecast(
                 )
                 best_dict["name"] = tf_meta.get("name", "cached_lstm")
                 metrics = tf_meta.get("metrics", {"rmse": None, "mape": None})
+                models_logger.info(
+                    "Using cached LSTM model=%s for %s rmse=%.4f",
+                    best_dict["name"],
+                    (ticker or "N/A"),
+                    float(metrics.get("rmse") or float("nan")),
+                    )
                 logger.info("Loaded cached LSTM model for %s", ticker)
             except Exception:
                 logger.exception("Error using cached LSTM model for %s", ticker)
@@ -327,6 +441,12 @@ def train_select_and_forecast(
             fcst_avg_all_df,
             fcst_avg_top3_df,
         )
+        models_logger.info(
+            "Using cached BEST model=%s for %s (fresh), rmse=%.4f",
+            best_dict.get("name") or "cached",
+            (ticker or "N/A"),
+            float(metrics.get("rmse") or float("nan")),
+        )
         return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
     # ---------- 5. Обучение с нуля ----------
@@ -337,6 +457,30 @@ def train_select_and_forecast(
         eval_tag=ticker,
         save_plots=True,
     )
+
+        # Логи по всем кандидатам и победителю
+    try:
+        cand_lines = []
+        for c in candidates:
+            rmse_c = getattr(c, "rmse", None)
+            cand_lines.append(f"{getattr(c, 'name', '?')}={rmse_c:.4f}" if rmse_c is not None else f"{getattr(c, 'name', '?')}=NA")
+
+        models_logger.info(
+            "Model candidates for %s: %s",
+            (ticker or "N/A"),
+            ", ".join(cand_lines),
+        )
+
+        best_rmse = getattr(best, "rmse", None)
+        models_logger.info(
+            "Winner model for %s: %s rmse=%.4f",
+            (ticker or "N/A"),
+            getattr(best, "name", "?"),
+            best_rmse if best_rmse is not None else float("nan"),
+        )
+    except Exception:
+        logger.exception("Failed to log model candidates for ticker=%s", ticker)
+
 
     # Прогноз лучшей модели
     y_fcst_30 = refit_and_forecast_30d(y, best)
@@ -361,6 +505,15 @@ def train_select_and_forecast(
         )
     except Exception:
         mape = np.nan
+    
+    models_logger.info(
+        "Final WF metrics for %s: model=%s rmse=%.4f mape=%s",
+        (ticker or "N/A"),
+        best.name,
+        float(rmse),
+        "NA" if mape != mape else f"{float(mape):.4f}",
+    )
+
 
     best_dict = {"name": best.name}
     metrics = {"rmse": float(rmse), "mape": float(mape) if mape == mape else None}
@@ -419,6 +572,30 @@ def train_select_and_forecast(
     except Exception:
         logger.exception("Saving model/forecasts failed for %s", ticker)
 
+        # Записываем статистику эффективности победившей модели
+    try:
+        model_type = None
+        extra = getattr(best, "extra", None)
+        if isinstance(extra, dict):
+            model_type = extra.get("type")
+
+        _append_model_stats(
+            ticker=ticker,
+            model_name=best.name,
+            model_type=model_type,
+            metrics=metrics,
+            data_sig=data_sig,
+            n_points=len(df),
+            start_dt=df.index[0],
+            end_dt=df.index[-1],
+            val_steps=val_steps,
+            extra=extra,       
+            source="train",
+        )
+    except Exception:
+        logger.exception("Failed to log model stats for ticker=%s", ticker)
+
+
     logger.info(
         "Trained from scratch: ticker=%s winner=%s rmse=%.4f",
         ticker,
@@ -434,34 +611,32 @@ def make_plot_image(
     history_df: pd.DataFrame,
     forecast_df: pd.DataFrame,
     ticker: str,
-    markers: list = None,
+    markers: list = None,   # параметр оставим для совместимости, но игнорируем
     title_suffix: str = "",
 ) -> io.BytesIO:
     plt.figure(figsize=(10, 5))
+
+    # История и прогноз
     plt.plot(history_df.index, history_df["Close"], label="History")
     plt.plot(forecast_df.index, forecast_df["forecast"], label="Forecast")
+
+    # Аккуратно соединяем последнюю точку истории с первой точкой прогноза,
+    # чтобы визуально не было "разрыва".
+    try:
+        if not history_df.empty and not forecast_df.empty:
+            plt.plot(
+                [history_df.index[-1], forecast_df.index[0]],
+                [history_df["Close"].iloc[-1], forecast_df["forecast"].iloc[0]],
+                linestyle=":",
+                linewidth=1.0,
+            )
+    except Exception:
+        pass
 
     title = f"{ticker}: History & 30-Day Forecast"
     if title_suffix:
         title += f" {title_suffix}"
     plt.title(title)
-
-    try:
-        if markers:
-            for m in markers:
-                try:
-                    if isinstance(m, dict):
-                        side = m.get("side", "long")
-                        dt = m.get("sell") if side == "short" else m.get("buy")
-                    else:
-                        dt, _label = m
-                    if dt is None:
-                        continue
-                    plt.axvline(dt, linestyle="--", alpha=0.35)
-                except Exception:
-                    continue
-    except Exception:
-        pass
 
     plt.xlabel("Date")
     plt.ylabel("Price (USD)")
@@ -472,6 +647,38 @@ def make_plot_image(
     plt.close()
     buf.seek(0)
     return buf
+
+
+def export_plot_pdf(
+    history_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    ticker: str,
+    out_path: str,
+) -> None:
+    plt.figure(figsize=(10, 5))
+    plt.plot(history_df.index, history_df["Close"], label="History")
+    plt.plot(forecast_df.index, forecast_df["forecast"], label="Forecast")
+
+    # Тоже соединяем последнюю точку истории с первой прогнозной
+    try:
+        if not history_df.empty and not forecast_df.empty:
+            plt.plot(
+                [history_df.index[-1], forecast_df.index[0]],
+                [history_df["Close"].iloc[-1], forecast_df["forecast"].iloc[0]],
+                linestyle=":",
+                linewidth=1.0,
+            )
+    except Exception:
+        pass
+
+    plt.title(f"{ticker}: History & 30-Day Forecast")
+    plt.xlabel("Date")
+    plt.ylabel("Price (USD)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, format="pdf", dpi=150, bbox_inches="tight")
+    plt.close()
+
 
 
 def export_plot_pdf(history_df: pd.DataFrame, forecast_df: pd.DataFrame, ticker: str, out_path: str) -> None:

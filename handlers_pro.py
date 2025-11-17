@@ -61,6 +61,11 @@ SUPPORTED_STOCKS = SUPPORTED_TICKERS
 SUPPORTED_CRYPTO = MAIN_CRYPTO
 SUPPORTED_FOREX = MAIN_FOREX
 
+# ⬇️ вот ЭТИ списки будут использоваться только для сигналов
+SIGNAL_STOCKS = SUPPORTED_STOCKS[:15]      # 15 акций
+SIGNAL_CRYPTO = SUPPORTED_CRYPTO[:15]      # 15 крипто
+SIGNAL_FOREX  = SUPPORTED_FOREX[:5]        # 5 форекс-пар
+
 
 def _fmt_until(ts: int):
     if not ts:
@@ -315,15 +320,25 @@ async def _best_of_category(tickers, label, app):
 
 
 async def daily_signals(app):
+    """
+    Ежедневные сигналы:
+    - для каждой категории считаем ЛУЧШИЙ тикер (максимальная ожидаемая прибыль при SIG_CAPITAL)
+    - сначала считаем все нужные категории,
+    - потом отправляем пользователю интро + сигналы.
+    """
     logger.info("daily_signals job start")
     users = pro_users_for_signal()
     if not users:
         logger.info("daily_signals: no pro users with active sub")
         return
 
-    cached_best = {}
+    cached_best: dict[str, dict] = {}
 
     async def best_for_key(key, tickers):
+        """
+        key: строка-ключ кэша ("stocks", "crypto", "forex" или "custom:..."),
+        tickers: список тикеров для перебора.
+        """
         if key in cached_best:
             return cached_best[key]
         best = await _best_of_category(tickers, key, app)
@@ -334,46 +349,91 @@ async def daily_signals(app):
         try:
             st = get_status(uid)
             if not st["signal_enabled"]:
+                logger.info("daily_signals: user_id=%s has signal_disabled, skip", uid)
                 continue
 
             mode = get_signal_cats(uid)
             custom_list = get_signal_list(uid) if mode == "custom" else []
             logger.info("daily_signals for user_id=%s mode=%s custom=%s", uid, mode, custom_list)
 
+            # 1) СНАЧАЛА считаем лучшие сигналы по нужным категориям
+            label_best_pairs: list[tuple[str, dict | None]] = []
+
+            if mode == "all":
+                stocks_best = await best_for_key("stocks", SIGNAL_STOCKS)
+                crypto_best = await best_for_key("crypto", SIGNAL_CRYPTO)
+                forex_best  = await best_for_key("forex",  SIGNAL_FOREX)
+
+                label_best_pairs.append(("Акции",  stocks_best))
+                label_best_pairs.append(("Крипта", crypto_best))
+                label_best_pairs.append(("Форекс", forex_best))
+
+            elif mode == "stocks":
+                stocks_best = await best_for_key("stocks", SIGNAL_STOCKS)
+                label_best_pairs.append(("Акции", stocks_best))
+
+            elif mode == "crypto":
+                crypto_best = await best_for_key("crypto", SIGNAL_CRYPTO)
+                label_best_pairs.append(("Крипта", crypto_best))
+
+            elif mode == "forex":
+                forex_best = await best_for_key("forex", SIGNAL_FOREX)
+                label_best_pairs.append(("Форекс", forex_best))
+
+            elif mode == "custom":
+                # custom_list — это строки тикеров из БД (например: ["AAPL", "MSFT", "BTC"])
+                key = "custom:" + ",".join(custom_list)
+                custom_best = await best_for_key(key, custom_list)
+                label_best_pairs.append(("Выбранные тикеры", custom_best))
+
+            else:
+                # fallback: как /signal_all
+                stocks_best = await best_for_key("stocks", SIGNAL_STOCKS)
+                crypto_best = await best_for_key("crypto", SIGNAL_CRYPTO)
+                forex_best  = await best_for_key("forex",  SIGNAL_FOREX)
+
+                label_best_pairs.append(("Акции",  stocks_best))
+                label_best_pairs.append(("Крипта", crypto_best))
+                label_best_pairs.append(("Форекс", forex_best))
+
+            # Если вообще нечего отправлять (теоретически), пропускаем пользователя
+            if not label_best_pairs:
+                logger.info("daily_signals: user_id=%s has empty label_best_pairs, skip", uid)
+                continue
+
+            # 2) Теперь, когда всё посчитано, отправляем интро
             intro = "Дневной сигнал (оценка прибыли на $1,000):\n"
             await app.bot.send_message(chat_id=uid, text=intro)
 
-            async def send_item(best, label):
-                if not best or best["profit"] <= 0:
+            # 3) Функция отправки одного блока сигнала
+            async def send_item(best, label: str):
+                if not best or best.get("profit") is None or best["profit"] <= 0:
                     await app.bot.send_message(chat_id=uid, text=f"{label}: сильных сигналов нет.")
                     return
-                img = make_plot_image(best["df"], best["fcst"], best["ticker"], title_suffix=f"(Сигнал {label})")
+
+                img = make_plot_image(
+                    best["df"],
+                    best["fcst"],
+                    best["ticker"],
+                    title_suffix=f"(Сигнал {label})",
+                )
                 metrics = best.get("metrics") or {}
-                rmse_str = f"{metrics.get('rmse'):.2f}" if metrics.get('rmse') is not None else "—"
-                cap = (f"{label}: {best['ticker']}\n"
-                       f"Модель: {best['best_name']} (RMSE={rmse_str})\n"
-                       f"Оценка прибыли: ~ {best['profit']:.2f} USD\n\n"
-                       f"{best['rec']}\n\n"
-                       "⚠️ Не является инвестсоветом.")
+                rmse_val = metrics.get("rmse")
+                rmse_str = f"{rmse_val:.2f}" if rmse_val is not None else "—"
+
+                cap = (
+                    f"{label}: {best['ticker']}\n"
+                    f"Модель: {best['best_name']} (RMSE={rmse_str})\n"
+                    f"Оценка прибыли: ~ {best['profit']:.2f} USD\n\n"
+                    f"{best['rec']}\n\n"
+                    "⚠️ Не является инвестсоветом."
+                )
+
                 await app.bot.send_photo(chat_id=uid, photo=img, caption=cap[:1024])
 
-            if mode == "all":
-                await send_item(await best_for_key("stocks", SUPPORTED_STOCKS), "Акции")
-                await send_item(await best_for_key("crypto", SUPPORTED_CRYPTO), "Крипта")
-                await send_item(await best_for_key("forex",  SUPPORTED_FOREX),  "Форекс")
-            elif mode == "stocks":
-                await send_item(await best_for_key("stocks", SUPPORTED_STOCKS), "Акции")
-            elif mode == "crypto":
-                await send_item(await best_for_key("crypto", SUPPORTED_CRYPTO), "Крипта")
-            elif mode == "forex":
-                await send_item(await best_for_key("forex",  SUPPORTED_FOREX),  "Форекс")
-            elif mode == "custom":
-                key = "custom:" + ",".join(custom_list)
-                await send_item(await best_for_key(key, custom_list), "Выбранные тикеры")
-            else:
-                await send_item(await best_for_key("stocks", SUPPORTED_STOCKS), "Акции")
-                await send_item(await best_for_key("crypto", SUPPORTED_CRYPTO), "Крипта")
-                await send_item(await best_for_key("forex",  SUPPORTED_FOREX),  "Форекс")
+            # 4) Отправляем сигналы по всем выбранным категориям
+            for label, best in label_best_pairs:
+                await send_item(best, label)
 
         except Exception:
             logger.exception("daily_signals failed for user_id=%s", uid)
@@ -620,7 +680,7 @@ async def debug_signal_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("Эта команда доступна только владельцу бота.")
         return
 
-    await msg.reply_text("🚀 Запускаю daily_signals() прямо сейчас…")
+    await msg.reply_text("🚀 Запускаю анализ сигнала прямо сейчас…")
     try:
         await daily_signals(context.application)
         await msg.reply_text("✅ daily_signals() завершился. Смотри свои сообщения и логи.")

@@ -27,6 +27,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
+    JobQueue, # ← добавили
 )
 
 
@@ -886,13 +887,17 @@ def main():
     init_db()
     init_reminders()
 
-    # важно: добавили post_init(post_init)
+    # если хочешь отдельный JobQueue — создаём, но НЕ стартуем руками
+    jq = JobQueue()
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .job_queue(jq)      # этого достаточно
         .build()
     )
+
     logger.info("Telegram application built")
 
     # хендлеры
@@ -921,6 +926,10 @@ def main():
     app.add_handler(CommandHandler("debug_payments_reset", debug_payments_reset_cmd))
     app.add_handler(CommandHandler("debug_models", debug_models_cmd))
     app.add_handler(CommandHandler("debug_warmup", debug_warmup_cmd))
+    app.add_handler(CommandHandler("debug_signal_now", debug_signal_now_cmd))
+    app.add_handler(CommandHandler("debug_remind_now", debug_remind_now_cmd))
+    app.add_handler(CommandHandler("fav_add", fav_add_cmd))
+    app.add_handler(CommandHandler("fav_remove", fav_remove_cmd))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_error_handler(error_handler)
 
