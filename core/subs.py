@@ -1,105 +1,93 @@
 # core/subs.py
 import os
-import sqlite3
 import time
-from contextlib import contextmanager
-from typing import Iterable, List, Optional
+from typing import List
 
-# ---------------- Config ----------------
-DB_PATH = os.path.abspath(
-    os.getenv(
-        "SUBS_DB_PATH",
-        os.path.join(os.path.dirname(__file__), "..", "artifacts", "subs.sqlite")
-    )
-)
+from core.db import db  # ← используем общий Postgres-коннектор
+
 FREE_DAILY = int(os.getenv("FREE_DAILY", "3"))
 PRO_DAILY  = int(os.getenv("PRO_DAILY", "10"))
 
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
 
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # ---------------- DB helpers ----------------
-@contextmanager
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    # Немного оптимизаций для SQLite в боте
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
 
-def _has_column(cur: sqlite3.Cursor, table: str, col: str) -> bool:
-    cur.execute(f"PRAGMA table_info({table})")
-    return any(r[1] == col for r in cur.fetchall())
-
-def _ensure_user_row(conn: sqlite3.Connection, user_id: int) -> None:
-    cur = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+def _ensure_user_row(conn, user_id: int) -> None:
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id=%s", (user_id,))
     if not cur.fetchone():
-        conn.execute("INSERT INTO users(user_id) VALUES(?)", (user_id,))
+        cur.execute("INSERT INTO users(user_id) VALUES(%s)", (user_id,))
+
 
 # ---------------- Schema / migrations ----------------
+
 def init_db():
+    """Создаёт таблицы в Postgres, если их ещё нет."""
     with db() as conn:
-        conn.execute("""
+        cur = conn.cursor()
+
+        # users: финальная версия схемы, без ALTER’ов
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id        INTEGER PRIMARY KEY,
-                tier           TEXT     NOT NULL DEFAULT 'free',
-                sub_until      INTEGER  NOT NULL DEFAULT 0,
-                daily_count    INTEGER  NOT NULL DEFAULT 0,
-                last_reset     INTEGER  NOT NULL DEFAULT 0,
-                signal_enabled INTEGER  NOT NULL DEFAULT 0
+                user_id        BIGINT PRIMARY KEY,
+                tier           TEXT    NOT NULL DEFAULT 'free',
+                sub_until      BIGINT  NOT NULL DEFAULT 0,
+                daily_count    INTEGER NOT NULL DEFAULT 0,
+                last_reset     BIGINT  NOT NULL DEFAULT 0,
+                signal_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                signal_cats    TEXT    NOT NULL DEFAULT 'all',
+                signal_list    TEXT    NOT NULL DEFAULT ''
             )
         """)
-        cur = conn.cursor()
-        # миграции недостающих колонок
-        if not _has_column(cur, "users", "signal_cats"):
-            conn.execute("ALTER TABLE users ADD COLUMN signal_cats TEXT DEFAULT 'all'")
-        if not _has_column(cur, "users", "signal_list"):
-            conn.execute("ALTER TABLE users ADD COLUMN signal_list TEXT DEFAULT ''")
 
-        # 👉 новая таблица для зафиксированных платежей
-        conn.execute("""
+        # зафиксированные платежи
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS payments (
                 tx_hash     TEXT PRIMARY KEY,
-                user_id     INTEGER,
-                amount_ton  REAL,
-                created_at  INTEGER NOT NULL
+                user_id     BIGINT,
+                amount_ton  DOUBLE PRECISION,
+                created_at  BIGINT NOT NULL
             )
         """)
 
 
 # ---------------- Tier / limits ----------------
+
 def is_pro(user_id: int) -> bool:
     now = int(time.time())
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        tier, sub_until = conn.execute(
-            "SELECT tier, sub_until FROM users WHERE user_id=?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT tier, sub_until FROM users WHERE user_id=%s",
             (user_id,)
-        ).fetchone()
-        # авто-даунгрейд, если просрочено
-        if tier == "pro" and sub_until and now > int(sub_until):
-            conn.execute("UPDATE users SET tier='free', sub_until=0 WHERE user_id=?", (user_id,))
+        )
+        tier, sub_until = cur.fetchone()
+        sub_until = int(sub_until or 0)
+
+        if tier == "pro" and sub_until and now > sub_until:
+            cur.execute(
+                "UPDATE users SET tier='free', sub_until=0 WHERE user_id=%s",
+                (user_id,)
+            )
             return False
-        return tier == "pro" and int(sub_until) > now
+        return tier == "pro" and sub_until > now
+
 
 def set_tier(user_id: int, tier: str, sub_until: int) -> None:
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        conn.execute(
-            "UPDATE users SET tier=?, sub_until=? WHERE user_id=?",
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET tier=%s, sub_until=%s WHERE user_id=%s",
             (tier, int(sub_until or 0), user_id)
         )
 
-def get_limits(user_id: int) -> int:
-    # владелец бота — условно бесконечный лимит
-    if BOT_OWNER_ID and user_id == BOT_OWNER_ID:
-        return 10**9  # можно любое большое число
 
+def get_limits(user_id: int) -> int:
+    if BOT_OWNER_ID and user_id == BOT_OWNER_ID:
+        return 10**9
     return PRO_DAILY if is_pro(user_id) else FREE_DAILY
 
 
@@ -107,54 +95,60 @@ def _maybe_reset_counter(user_id: int) -> None:
     now = int(time.time())
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        daily_count, last_reset = conn.execute(
-            "SELECT daily_count, last_reset FROM users WHERE user_id=?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT daily_count, last_reset FROM users WHERE user_id=%s",
             (user_id,)
-        ).fetchone()
+        )
+        daily_count, last_reset = cur.fetchone()
         last_reset = int(last_reset or 0)
-        # простой «каждые 86400 сек»; при желании можно заменить на сброс по полуночам таймзоны
         if now - last_reset >= 86400:
-            conn.execute(
-                "UPDATE users SET daily_count=0, last_reset=? WHERE user_id=?",
+            cur.execute(
+                "UPDATE users SET daily_count=0, last_reset=%s WHERE user_id=%s",
                 (now, user_id)
             )
 
+
 def can_consume(user_id: int) -> bool:
-    # владелец бота всегда может
     if BOT_OWNER_ID and user_id == BOT_OWNER_ID:
         return True
-
     _maybe_reset_counter(user_id)
     with db() as conn:
-        cnt, = conn.execute(
-            "SELECT daily_count FROM users WHERE user_id=?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT daily_count FROM users WHERE user_id=%s",
             (user_id,),
-        ).fetchone()
+        )
+        cnt, = cur.fetchone()
     return int(cnt) < get_limits(user_id)
 
 
 def consume_one(user_id: int) -> None:
-    # для владельца не трогаем счётчик вообще
     if BOT_OWNER_ID and user_id == BOT_OWNER_ID:
         return
-
     _maybe_reset_counter(user_id)
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        conn.execute(
-            "UPDATE users SET daily_count = daily_count + 1 WHERE user_id=?",
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET daily_count = daily_count + 1 WHERE user_id=%s",
             (user_id,),
         )
 
 
 # ---------------- Status / signal toggle ----------------
+
 def get_status(user_id: int) -> dict:
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        row = conn.execute("""
-            SELECT tier, sub_until, daily_count, last_reset, signal_enabled, signal_cats, signal_list
-            FROM users WHERE user_id=?
-        """, (user_id,)).fetchone()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT tier, sub_until, daily_count, last_reset,
+                   signal_enabled, signal_cats, signal_list
+            FROM users WHERE user_id=%s
+        """, (user_id,))
+        row = cur.fetchone()
+
     tier, sub_until, daily_count, last_reset, signal_enabled, signal_cats, signal_list = row
     return {
         "tier": tier or "free",
@@ -166,50 +160,57 @@ def get_status(user_id: int) -> dict:
         "signal_list": (signal_list or "")
     }
 
+
 def set_signal(user_id: int, enabled: bool) -> None:
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        conn.execute(
-            "UPDATE users SET signal_enabled=? WHERE user_id=?",
-            (1 if enabled else 0, user_id)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET signal_enabled=%s WHERE user_id=%s",
+            (enabled, user_id)
         )
 
+
 def pro_users_for_signal() -> List[int]:
-    """Возвращает user_id всех валидных PRO (подписка активна)."""
     now = int(time.time())
     with db() as conn:
-        rows = conn.execute(
-            "SELECT user_id FROM users WHERE tier='pro' AND sub_until>?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id FROM users WHERE tier='pro' AND sub_until>%s",
             (now,)
-        ).fetchall()
+        )
+        rows = cur.fetchall()
     return [r[0] for r in rows]
 
-# ---------------- Signal preferences (категории / списки) ----------------
+
+# ---------------- Signal preferences ----------------
+
 def set_signal_cats(user_id: int, cats: str) -> None:
-    """
-    cats: 'all' | 'stocks' | 'crypto' | 'forex' | 'custom'
-    """
     cats = (cats or "all").lower()
     if cats not in {"all", "stocks", "crypto", "forex", "custom"}:
         cats = "all"
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        conn.execute(
-            "UPDATE users SET signal_cats=? WHERE user_id=?",
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET signal_cats=%s WHERE user_id=%s",
             (cats, user_id)
         )
+
 
 def get_signal_cats(user_id: int) -> str:
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        row = conn.execute("SELECT signal_cats FROM users WHERE user_id=?", (user_id,)).fetchone()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT signal_cats FROM users WHERE user_id=%s",
+            (user_id,)
+        )
+        row = cur.fetchone()
         return (row[0] or "all") if row else "all"
 
+
 def set_signal_list(user_id: int, csv_or_iterable) -> None:
-    """
-    Принимает либо строку 'AAPL,MSFT,BTC', либо любой итерируемый список тикеров.
-    Хранится как CSV в верхнем регистре, без пробелов.
-    """
     if isinstance(csv_or_iterable, str):
         tickers = [t.strip().upper() for t in csv_or_iterable.split(",") if t.strip()]
     else:
@@ -217,25 +218,34 @@ def set_signal_list(user_id: int, csv_or_iterable) -> None:
     norm_csv = ",".join(tickers)
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        conn.execute(
-            "UPDATE users SET signal_list=? WHERE user_id=?",
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET signal_list=%s WHERE user_id=%s",
             (norm_csv, user_id)
         )
+
 
 def get_signal_list(user_id: int) -> List[str]:
     with db() as conn:
         _ensure_user_row(conn, user_id)
-        row = conn.execute("SELECT signal_list FROM users WHERE user_id=?", (user_id,)).fetchone()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT signal_list FROM users WHERE user_id=%s",
+            (user_id,)
+        )
+        row = cur.fetchone()
         if not row or not row[0]:
             return []
         return [t.strip().upper() for t in row[0].split(",") if t.strip()]
+
 
 # ---------------- Payments (TON) ----------------
 
 def is_payment_processed(tx_hash: str) -> bool:
     with db() as conn:
-        cur = conn.execute(
-            "SELECT 1 FROM payments WHERE tx_hash=?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM payments WHERE tx_hash=%s",
             (tx_hash,)
         )
         return cur.fetchone() is not None
@@ -244,8 +254,12 @@ def is_payment_processed(tx_hash: str) -> bool:
 def mark_payment_processed(tx_hash: str, user_id: int, amount_ton: float) -> None:
     now = int(time.time())
     with db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO payments(tx_hash, user_id, amount_ton, created_at) "
-            "VALUES(?, ?, ?, ?)",
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO payments(tx_hash, user_id, amount_ton, created_at)
+            VALUES(%s, %s, %s, %s)
+            ON CONFLICT (tx_hash) DO NOTHING
+            """,
             (tx_hash, user_id, float(amount_ton), now)
         )
