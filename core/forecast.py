@@ -80,6 +80,42 @@ def _make_future_index(last_ts: pd.Timestamp, periods: int, ticker: str) -> pd.D
         return pd.date_range(start=start, periods=periods, freq="D")
     return pd.bdate_range(start=start, periods=periods)
 
+# Жёсткость фильтра можно крутить из .env
+FC_MAX_MULT = float(os.getenv("FC_MAX_MULT", "5.0"))      # макс. ×5 от последней цены
+FC_MIN_MULT = float(os.getenv("FC_MIN_MULT", "0.2"))      # мин. ×0.2
+FC_MAX_DAILY_CHG = float(os.getenv("FC_MAX_DAILY_CHG", "0.5"))  # макс. дневной скачок 50%
+
+def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> Optional[np.ndarray]:
+    """
+    Валидирует 30-дневный прогноз.
+    Если прогноз выглядит «поехавшим» — возвращает None.
+    """
+    arr = np.asarray(arr, dtype=float)
+
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return None
+
+    # last_close должен быть вменяемый
+    if not np.isfinite(last_close) or last_close <= 0:
+        return None
+
+    # цены должны быть > 0
+    if np.any(arr <= 0):
+        return None
+
+    lo = last_close * FC_MIN_MULT
+    hi = last_close * FC_MAX_MULT
+
+    # слишком далеко от текущей цены
+    if np.min(arr) < lo or np.max(arr) > hi:
+        return None
+
+    # слишком дикие дневные движения
+    rel = np.diff(arr) / arr[:-1]
+    if np.any(np.abs(rel) > FC_MAX_DAILY_CHG):
+        return None
+
+    return arr
 
 # ---------- Ансамбли ----------
 
@@ -106,26 +142,21 @@ def _build_ensembles_from_candidates(
         try:
             s = refit_and_forecast_30d(y, cand)
             arr = s.values.astype(float)
-            if arr.size == 0:
-                return None
-            if not np.all(np.isfinite(arr)):
-                logger.warning("Skip candidate %s: non-finite values in forecast",
-                               getattr(cand, "name", "?"))
-                return None
-            max_abs = float(np.max(np.abs(arr)))
-            if max_abs > abs(last_close) * SCALE_FACTOR:
+
+            arr = _sanitize_forecast_array(arr, last_close)
+            if arr is None:
                 logger.warning(
-                    "Skip candidate %s: insane forecast scale max=%.3g last_close=%.3g",
-                    getattr(cand, "name", "?"),
-                    max_abs,
-                    last_close,
+                    "Skip candidate %s: insane or invalid forecast",
+                    getattr(cand, "name", "?")
                 )
                 return None
+
             return arr
         except Exception:
             logger.exception("refit_and_forecast_30d failed for candidate %s",
-                             getattr(cand, "name", "?"))
+                            getattr(cand, "name", "?"))
             return None
+
 
     # --- среднее по ВСЕМ кандидатам (после фильтрации) ---
     all_fcsts: List[np.ndarray] = []
@@ -483,7 +514,19 @@ def train_select_and_forecast(
 
 
     # Прогноз лучшей модели
-    y_fcst_30 = refit_and_forecast_30d(y, best)
+    raw_fcst_30 = refit_and_forecast_30d(y, best)
+    last_close = float(y.iloc[-1])
+
+    sanitized = _sanitize_forecast_array(raw_fcst_30.values, last_close)
+    if sanitized is None:
+        logger.warning(
+            "Winner model '%s' produced insane forecast for %s — falling back to flat.",
+            best.name, ticker
+        )
+        # fallback: плоский прогноз = последняя цена
+        sanitized = np.full(30, last_close, dtype=float)
+
+    y_fcst_30 = pd.Series(sanitized, index=future_idx)
     fcst_best_df = pd.DataFrame({"forecast": y_fcst_30.values}, index=future_idx)
 
     # Ансамбли

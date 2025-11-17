@@ -1,9 +1,9 @@
 """recommend.py Core module for the Telegram stock forecast bot."""
 import os
 
-MIN_PROFIT_USD = float(os.getenv('MIN_PROFIT_USD', '0.5'))
-MIN_PROFIT_PCT = float(os.getenv('MIN_PROFIT_PCT', '0.001'))
-RMSE_MULTIPLIER = float(os.getenv('RMSE_MULTIPLIER', '0.5'))
+MIN_PROFIT_PCT = float(os.getenv('MIN_PROFIT_PCT', '0.015'))
+MIN_PROFIT_USD = float(os.getenv('MIN_PROFIT_USD', '3.0'))
+RMSE_MULTIPLIER = float(os.getenv('RMSE_MULTIPLIER', '0.7'))
 
 UP_EMOJI = "🔴📉"    # использовано как "продажа"
 DOWN_EMOJI = "🟢📈"  # использовано как "покупка"
@@ -143,14 +143,6 @@ def _build_short_trades(s, mins, maxs, capital_usd, model_rmse):
 def generate_recommendations(fcst_df, capital_usd, model_rmse=None):
     """
     Генерирует торговые рекомендации на основе прогноза цен.
-
-    Возвращает:
-        summary_text: строка с описанием разных сценариев (лонг / шорт).
-        profit_est_usd: оценка максимальной прибыли среди сценариев.
-        markers: список словарей, каждый с полями:
-            - side: 'long' или 'short'
-            - buy, sell: даты
-            - buy_price, sell_price, pnl: float
     """
     s = fcst_df['forecast']
     mins, maxs = _local_extrema(s)
@@ -167,12 +159,34 @@ def generate_recommendations(fcst_df, capital_usd, model_rmse=None):
 
     all_markers = long_markers + short_markers
 
+    # Общий "наклон" прогноза — от первой до последней точки
+    try:
+        first_price = float(s.iloc[0])
+        last_price = float(s.iloc[-1])
+        if first_price > 0:
+            delta_pct = (last_price - first_price) / first_price * 100.0
+        else:
+            delta_pct = 0.0
+    except Exception:
+        delta_pct = 0.0
+
     if not long_lines and not short_lines:
-        summary = (
-            "По прогнозу нет достаточно сильных локальных сигналов ни для лонга, "
-            "ни для шорта (мелкие сигналы были отфильтрованы по порогу прибыли/rmse). "
-            "Рекомендуется наблюдать за динамикой и рисками."
-        )
+        # Нет сделок, но тренд может быть сильным
+        if abs(delta_pct) >= TREND_ALERT_PCT:
+            direction = "рост" if delta_pct > 0 else "снижение"
+            summary = (
+                f"Модель ожидает выраженный {direction} цены (~{delta_pct:+.2f}% за период прогноза), "
+                "но локальные точки входа/выхода по стратегии (минимумы/максимумы) не проходят "
+                "фильтры по ожидаемой прибыли и надёжности (RMSE).\n\n"
+                "В такой ситуации разумно наблюдать за инструментом и оценивать риски вручную, "
+                "а не входить по формальным сигналам."
+            )
+        else:
+            summary = (
+                "По прогнозу нет достаточно сильных локальных сигналов ни для лонга, "
+                "ни для шорта (мелкие сигналы были отфильтрованы по порогу прибыли/RMSE). "
+                "Рекомендуется наблюдать за динамикой и рисками."
+            )
         est_profit = 0.0
     else:
         parts = []
@@ -190,7 +204,6 @@ def generate_recommendations(fcst_df, capital_usd, model_rmse=None):
             )
 
         summary = "\n\n".join(parts)
-        # оценка = лучший из сценариев (можешь заменить на сумму, если нужно)
         est_profit = float(max(long_profit, short_profit))
 
     return summary, est_profit, all_markers
