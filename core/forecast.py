@@ -21,12 +21,11 @@ from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 logger = logging.getLogger(__name__)
 models_logger = logging.getLogger("models")
 
-MODEL_VERSION = "v2"
+MODEL_VERSION = "v3"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
-
-# 🔧 флаг для управления ансамблями: 1 — включены, 0 — выключены
 ENSEMBLES_ENABLED = os.getenv("ENSEMBLES_ENABLED", "1") == "1"
+
 
 # Куда складываем статистику по моделям
 STATS_PATH = (
@@ -83,37 +82,39 @@ FC_MIN_MULT = float(os.getenv("FC_MIN_MULT", "0.2"))  # мин. ×0.2
 FC_MAX_DAILY_CHG = float(os.getenv("FC_MAX_DAILY_CHG", "0.5"))  # макс. дневной скачок 50%
 
 
-def _sanitize_forecast_array(
-    arr: np.ndarray, last_close: float
-) -> Optional[np.ndarray]:
-    """
-    Валидирует 30-дневный прогноз.
-    Если прогноз выглядит «поехавшим» — возвращает None.
-    """
+def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> Optional[np.ndarray]:
     arr = np.asarray(arr, dtype=float)
 
+    # 1) базовая проверка на NaN/inf
     if arr.size == 0 or not np.all(np.isfinite(arr)):
         return None
 
-    # last_close должен быть вменяемый
     if not np.isfinite(last_close) or last_close <= 0:
         return None
 
-    # цены должны быть > 0
+    # 2) запрет на нулевые/отрицательные цены
     if np.any(arr <= 0):
         return None
 
-    lo = last_close * FC_MIN_MULT
-    hi = last_close * FC_MAX_MULT
+    # 3) очень мягкие границы, только от совсем выноса в космос
+    lo = last_close * FC_MIN_MULT   # но FC_MIN_MULT сделай чем-то типа 0.01
+    hi = last_close * FC_MAX_MULT   # а FC_MAX_MULT — 50 или 100
 
-    # слишком далеко от текущей цены
     if np.min(arr) < lo or np.max(arr) > hi:
+        # считаем действительно поехавшим
         return None
 
-    # слишком дикие дневные движения
+    # 4) ДНЕВНЫЕ СКАЧКИ НЕ РУБИМ ЖЁСТКО
+    # можно либо вообще убрать этот блок, либо сильно ослабить:
     rel = np.diff(arr) / arr[:-1]
     if np.any(np.abs(rel) > FC_MAX_DAILY_CHG):
-        return None
+        # если сильно нервничаешь — логируем, но НЕ превращаем в flat
+        logger.warning(
+            "Forecast has big daily moves (max=%.2f). Leaving as is.",
+            float(np.max(np.abs(rel)))
+        )
+        # и просто возвращаем arr без обнуления
+        return arr
 
     return arr
 
@@ -493,10 +494,10 @@ def train_select_and_forecast(
             except Exception:
                 logger.exception("Error using cached LSTM model for %s", ticker)
 
-    # ---------- 4. Если best есть из кэша: считаем/не считаем ансамбли и сохраняем три прогноза ----------
+        # ---------- 4. Если best есть из кэша: считаем / не считаем ансамбли и сохраняем три прогноза ----------
     if fcst_best_df is not None:
         if ENSEMBLES_ENABLED:
-            # считаем кандидатов и ансамбли
+            # как раньше — считаем кандидатов и ансамбли
             _, candidates = select_and_fit_with_candidates(
                 y,
                 val_steps=val_steps,
@@ -512,7 +513,7 @@ def train_select_and_forecast(
             if fcst_avg_top3_df.empty:
                 fcst_avg_top3_df = fcst_best_df.copy()
         else:
-            # ⚡️ ансамбли выключены — используем best как proxy для avg_all и avg_top3
+            # ансамбли выключены — просто используем лучший прогноз как proxy
             fcst_avg_all_df = fcst_best_df.copy()
             fcst_avg_top3_df = fcst_best_df.copy()
 
@@ -524,12 +525,13 @@ def train_select_and_forecast(
             fcst_avg_top3_df,
         )
         models_logger.info(
-            "Using cached BEST model=%s for %s (ENSEMBLES_ENABLED=%s)",
+            "Using cached BEST model=%s for %s (fresh, ENSEMBLES_ENABLED=%s)",
             best_dict.get("name") or "cached",
             (ticker or "N/A"),
             ENSEMBLES_ENABLED,
         )
         return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
+
 
     # ---------- 5. Обучение с нуля ----------
     best, candidates = select_and_fit_with_candidates(
@@ -582,8 +584,7 @@ def train_select_and_forecast(
 
     y_fcst_30 = pd.Series(sanitized, index=future_idx)
     fcst_best_df = pd.DataFrame({"forecast": y_fcst_30.values}, index=future_idx)
-
-    # Ансамбли
+    
     if ENSEMBLES_ENABLED:
         fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
             y, candidates, future_idx
@@ -593,7 +594,7 @@ def train_select_and_forecast(
         if fcst_avg_top3_df.empty:
             fcst_avg_top3_df = fcst_best_df.copy()
     else:
-        # ⚡️ ансамбли выключены — просто копируем лучший прогноз
+        # ансамбли выключены — оба варианта равны лучшей модели
         fcst_avg_all_df = fcst_best_df.copy()
         fcst_avg_top3_df = fcst_best_df.copy()
 
@@ -703,10 +704,9 @@ def train_select_and_forecast(
         logger.exception("Failed to log model stats for ticker=%s", ticker)
 
     logger.info(
-        "Trained from scratch: ticker=%s winner=%s rmse=%.4f (ENSEMBLES_ENABLED=%s)",
+        "Trained from scratch: ticker=%s winner=%s rmse=%.4f",
         ticker,
         best_dict["name"],
         metrics["rmse"] if metrics["rmse"] is not None else float("nan"),
-        ENSEMBLES_ENABLED,
     )
     return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df

@@ -12,7 +12,6 @@ import sys
 from datetime import date as _date
 from concurrent.futures import ProcessPoolExecutor
 
-
 from dotenv import load_dotenv
 
 from telegram import (
@@ -30,9 +29,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
-    JobQueue, # ← добавили
+    JobQueue,
 )
-
 
 # ---------- ENV ----------
 load_dotenv()
@@ -59,7 +57,6 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 PAYMENTS_LOG = os.path.join("artifacts", "payments.log")
 MODELS_LOG = os.path.join("artifacts", "models.log")
-
 
 payments_logger = logging.getLogger("payments")
 payments_logger.setLevel(logging.INFO)
@@ -102,7 +99,7 @@ from core.plot_utils import export_plot_pdf, make_plot_image
 from core.reminders import init_reminders, add_reminder, count_active, due_for_day, mark_sent
 from core import model_cache
 from core.favorites import get_favorites, add_favorite, remove_favorite
-from core import warmup 
+from core import warmup
 
 from ui import (
     HELP_TEXT,
@@ -136,17 +133,19 @@ from handlers_pro import (
     daily_signals_job,
     reminders_job,
     payments_redeem_job,
-    debug_signal_now_cmd,      # ← добавили
+    debug_signal_now_cmd,
     debug_remind_now_cmd,
-    debug_warmup_cmd,      # ← добавили
+    debug_warmup_cmd,
 )
-
 
 # Глобальный реестр "идущих" прогнозов: signature -> asyncio.Future
 INFLIGHT_FORECASTS: dict[str, asyncio.Future] = {}
+
+
 def _no_inflight() -> bool:
     # True, если нет обучений в процессе
     return not INFLIGHT_FORECASTS
+
 
 warmup.set_inflight_checker(_no_inflight)
 INFLIGHT_LOCK = asyncio.Lock()
@@ -160,7 +159,7 @@ logger.info("Using FORECAST_WORKERS=%s", FORECAST_WORKERS)
 
 async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_photo_fn, user_id=None):
     """
-    Строит 3 прогноза (best/top3/all), отправляет 3 картинки + тексты.
+    Строит прогноз по лучшей модели, отправляет 1 картинку + текст.
     """
     logger.info("Forecast start: user_id=%s ticker=%s amount=%s", user_id, ticker, amount)
     try:
@@ -176,8 +175,7 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
 
         logger.debug("History loaded: ticker=%s len=%d last_dt=%s", resolved, len(df), df.index[-1])
 
-        # 2) три прогноза
-        # общий расчёт для всех конкурентных запросов к этому df/ticker
+        # 2) общий расчёт для всех конкурентных запросов к этому df/ticker
         best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df = await _get_shared_forecast(df, resolved)
 
         logger.info(
@@ -185,47 +183,36 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
             resolved, best["name"], metrics.get("rmse") if metrics else -1.0
         )
 
-        # 3) рекомендации
-        rec_best,  profit_best,  markers_best  = generate_recommendations(
+        # 3) рекомендации — только по лучшей модели
+        rec_best, profit_best, markers_best = generate_recommendations(
             fcst_best_df, amount, model_rmse=metrics.get('rmse') if metrics else None
         )
-        rec_all,   profit_all,   markers_all   = generate_recommendations(
-            fcst_avg_all_df, amount, model_rmse=metrics.get('rmse') if metrics else None
-        )
-        rec_top3,  profit_top3,  markers_top3  = generate_recommendations(
-            fcst_avg_top3_df, amount, model_rmse=metrics.get('rmse') if metrics else None
-        )
 
-        logger.debug(
-            "Recs: ticker=%s profit_best=%.2f profit_top3=%.2f profit_all=%.2f",
-            resolved, profit_best, profit_top3, profit_all
+        # 4) картинка только по лучшей модели
+        img_best = make_plot_image(
+            df,
+            fcst_best_df,
+            resolved,
+            markers=markers_best,
+            title_suffix="(Лучшая модель)"
         )
 
-        # 4) картинки
-        img_best = make_plot_image(df, fcst_best_df,     resolved, markers=markers_best,  title_suffix="(Лучшая модель)")
-        img_t3   = make_plot_image(df, fcst_avg_top3_df, resolved, markers=markers_top3, title_suffix="(Ансамбль топ-3)")
-        img_all  = make_plot_image(df, fcst_avg_all_df,  resolved, markers=markers_all,  title_suffix="(Ансамбль всех)")
-
-        # 5) (опционально) PDF
+        # 5) (опционально) PDF — тоже только best
         try:
             from datetime import datetime as _dt
             art_dir = os.path.join(os.path.dirname(__file__), "artifacts")
             os.makedirs(art_dir, exist_ok=True)
             ts = _dt.utcnow().strftime('%Y%m%d_%H%M%S')
-            export_plot_pdf(df, fcst_best_df,     resolved, os.path.join(art_dir, f"{resolved}_best_{ts}.pdf"))
-            export_plot_pdf(df, fcst_avg_top3_df, resolved, os.path.join(art_dir, f"{resolved}_avg-top3_{ts}.pdf"))
-            export_plot_pdf(df, fcst_avg_all_df,  resolved, os.path.join(art_dir, f"{resolved}_avg-all_{ts}.pdf"))
+            export_plot_pdf(df, fcst_best_df, resolved, os.path.join(art_dir, f"{resolved}_best_{ts}.pdf"))
             logger.debug("PDF exported: ticker=%s ts=%s", resolved, ts)
         except Exception as e:
             logger.warning("PDF export failed for ticker=%s: %s", resolved, e)
 
-        # 6) дельты
-        last_close = float(df['Close'].iloc[-1])
-        delta_best = ((fcst_best_df['forecast'].iloc[-1]     - last_close) / last_close) * 100.0
-        delta_t3   = ((fcst_avg_top3_df['forecast'].iloc[-1] - last_close) / last_close) * 100.0
-        delta_all  = ((fcst_avg_all_df['forecast'].iloc[-1]  - last_close) / last_close) * 100.0
+        # 6) дельта по лучшему прогнозу
+        last_close = float(df["Close"].iloc[-1])
+        delta_best = ((fcst_best_df["forecast"].iloc[-1] - last_close) / last_close) * 100.0
 
-        # 7) подписи
+        # 7) подпись
         cap_best = (
             f"Тикер: {resolved}\n"
             f"Лучшая модель: {best['name']} (RMSE={metrics['rmse']:.2f})\n"
@@ -234,35 +221,15 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
             f"Ориентировочная прибыль при капитале {amount:.2f} USD: {profit_best:.2f} USD\n"
             "⚠️ Не является инвестсоветом."
         )
-        cap_t3 = (
-            f"Тикер: {resolved}\n"
-            f"Ансамбль: среднее по топ-3 моделям (минимальный RMSE)\n"
-            f"Изменение цены (30д): {delta_t3:+.2f}%\n\n"
-            f"{rec_top3}\n\n"
-            f"Ориентировочная прибыль при капитале {amount:.2f} USD: {profit_top3:.2f} USD\n"
-            "⚠️ Не является инвестсоветом."
-        )
-        cap_all = (
-            f"Тикер: {resolved}\n"
-            f"Ансамбль: среднее по всем моделям-кандидатам\n"
-            f"Изменение цены (30д): {delta_all:+.2f}%\n\n"
-            f"{rec_all}\n\n"
-            f"Ориентировочная прибыль при капитале {amount:.2f} USD: {profit_all:.2f} USD\n"
-            "⚠️ Не является инвестсоветом."
-        )
 
-        # 8) даты для «Напомнить…»
-        date_best = _pick_reminder_date(markers_best,  fcst_best_df)
-        date_t3   = _pick_reminder_date(markers_top3, fcst_avg_top3_df)
-        date_all  = _pick_reminder_date(markers_all,  fcst_avg_all_df)
-        logger.debug("Reminder dates: best=%s top3=%s all=%s", date_best, date_t3, date_all)
+        # 8) даты для «Напомнить…» (только best)
+        date_best = _pick_reminder_date(markers_best, fcst_best_df)
+        logger.debug("Reminder dates: best=%s", date_best)
 
-        # Клавиатуры «Напомнить»
+        # Клавиатура «Напомнить» (вариант best)
         kb_best = _reminders_keyboard_from_markers(resolved, "best", markers_best)
-        kb_t3   = _reminders_keyboard_from_markers(resolved, "top3", markers_top3)
-        kb_all  = _reminders_keyboard_from_markers(resolved, "all",  markers_all)
 
-        # 1/3 best
+        # Отправляем ОДНУ картинку с лучшим прогнозом
         if len(cap_best) <= CAPTION_MAX:
             await (reply_photo_fn(photo=img_best, caption=cap_best, reply_markup=kb_best) if kb_best
                    else reply_photo_fn(photo=img_best, caption=cap_best))
@@ -272,44 +239,24 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
             for i in range(0, len(cap_best), TEXT_MAX):
                 await reply_text_fn(cap_best[i:i + TEXT_MAX])
 
-        # 2/3 top3
-        if len(cap_t3) <= CAPTION_MAX:
-            await (reply_photo_fn(photo=img_t3, caption=cap_t3, reply_markup=kb_t3) if kb_t3
-                   else reply_photo_fn(photo=img_t3, caption=cap_t3))
-        else:
-            await (reply_photo_fn(photo=img_t3, reply_markup=kb_t3) if kb_t3
-                   else reply_photo_fn(photo=img_t3))
-            for i in range(0, len(cap_t3), TEXT_MAX):
-                await reply_text_fn(cap_t3[i:i + TEXT_MAX])
-
-        # 3/3 all
-        if len(cap_all) <= CAPTION_MAX:
-            await (reply_photo_fn(photo=img_all, caption=cap_all, reply_markup=kb_all) if kb_all
-                   else reply_photo_fn(photo=img_all, caption=cap_all))
-        else:
-            await (reply_photo_fn(photo=img_all, reply_markup=kb_all) if kb_all
-                   else reply_photo_fn(photo=img_all))
-            for i in range(0, len(cap_all), TEXT_MAX):
-                await reply_text_fn(cap_all[i:i + TEXT_MAX])
-
-        # 10) меню
+        # 9) меню
         await reply_text_fn("Быстрый выбор категории:", reply_markup=category_keyboard())
 
-        # 11) лог (по лучшей модели)
+        # 10) лог (по лучшей модели)
         try:
             log_request(
                 user_id=user_id,
                 ticker=resolved,
                 amount=amount,
-                best_model=best['name'],
-                metric_name='RMSE',
-                metric_value=metrics['rmse'],
+                best_model=best["name"],
+                metric_name="RMSE",
+                metric_value=metrics["rmse"],
                 est_profit=profit_best,
             )
         except Exception:
             logger.exception("log_request failed for user_id=%s ticker=%s", user_id, resolved)
 
-        # 12) мягкий upsell (если не Pro)
+        # 11) мягкий upsell (если не Pro)
         try:
             if user_id:
                 st = get_status(user_id)
@@ -329,6 +276,7 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
     except Exception:
         logger.exception("Error in _run_forecast_for: ticker=%s user_id=%s", ticker, user_id)
         await reply_text_fn("Ошибка при построении прогноза.", reply_markup=category_keyboard())
+
 
 async def _get_shared_forecast(df, resolved_ticker: str):
     """
@@ -354,8 +302,7 @@ async def _get_shared_forecast(df, resolved_ticker: str):
         try:
             loop = asyncio.get_running_loop()
 
-            # 🔥 тяжёлая функция — сразу в process pool
-            # ВАЖНО: train_select_and_forecast — ТОП-ЛЕВЕЛ функция (в core.forecast)
+            # тяжёлая функция — в process pool
             res = await loop.run_in_executor(
                 FORECAST_EXECUTOR,
                 train_select_and_forecast,
@@ -367,7 +314,6 @@ async def _get_shared_forecast(df, resolved_ticker: str):
             return res
         except Exception as e:
             fut.set_exception(e)
-            # пробрасываем дальше, чтобы /forecast увидел ошибку и обработчик её залогировал
             raise
         finally:
             async with INFLIGHT_LOCK:
@@ -377,14 +323,13 @@ async def _get_shared_forecast(df, resolved_ticker: str):
         return await fut
 
 
-
-
 warmup.set_forecast_fn(_get_shared_forecast)
+
 
 def _pick_reminder_date(markers, fcst_df):
     try:
-        if markers and markers[0].get('buy'):
-            return markers[0]['buy'].to_pydatetime().date()
+        if markers and markers[0].get("buy"):
+            return markers[0]["buy"].to_pydatetime().date()
     except Exception:
         pass
     return None
@@ -479,7 +424,11 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if len(context.args) < 1:
-            await msg.reply_text("Использование: /forecast <TICKER>", reply_markup=category_keyboard())
+            # Если пользователь нажал /forecast из меню — просто показываем быстрый выбор
+            await msg.reply_text(
+                "Быстрый выбор категории:",
+                reply_markup=category_keyboard()
+            )
             return
 
         if not can_consume(user_id):
@@ -496,13 +445,13 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_ticker = context.args[0].upper().strip()
         consume_one(user_id)
 
-        # 👉 быстрый ответ ВСЕГДА
+        # быстрый ответ всегда
         await msg.reply_text(
             f"✅ Запрос принят. Сейчас загружу данные по {user_ticker} и посчитаю прогноз.\n"
             f"Это может занять несколько минут, я пришлю результат, когда буду готов.",
         )
 
-        # 👉 тяжёлая часть — в фоне
+        # тяжёлая часть — в фоне
         async def _job():
             try:
                 await _run_forecast_for(
@@ -521,6 +470,7 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Error in /forecast handler for user_id=%s", u.id if u else None)
         await msg.reply_text("Ошибка при обработке команды /forecast.", reply_markup=category_keyboard())
+
 
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -789,6 +739,7 @@ async def shutdown_cmd(update, context):
     logger.info("Exiting process with os._exit(0) after /shutdown")
     os._exit(0)
 
+
 async def restart_cmd(update, context):
     u = update.effective_user
     msg = update.effective_message
@@ -802,8 +753,8 @@ async def restart_cmd(update, context):
 
     await context.application.stop()
 
-    import os, sys
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    import os as _os, sys as _sys
+    _os.execv(_sys.executable, [_sys.executable] + _sys.argv)
 
 
 # --------------- Callback handler ---------------
@@ -844,14 +795,14 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id is not None:
             consume_one(user_id)
 
-        # ⚡️ МГНОВЕННЫЙ ОТВЕТ ПОЛЬЗОВАТЕЛЮ
+        # мгновенный ответ пользователю
         await query.message.reply_text(
             f"✅ Запрос по {ticker} принят.\n"
             f"Считаю прогноз, это может занять некоторое время.\n"
             f"Результат пришлю сюда, как только будет готов.",
         )
 
-        # 🧠 ТЯЖЁЛАЯ ЧАСТЬ — В ФОНЕ
+        # тяжёлая часть — в фоне
         async def _job():
             try:
                 await _run_forecast_for(
@@ -891,10 +842,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await forex(update, context)
             return
         if kind == "pro":
-            await query.message.reply_text(
-                "Pro-подписка: 1 TON/мес. 10 прогнозов/день + ежедневные сигналы.\nКоманды: /buy, /signal_on",
-                reply_markup=pro_cta_keyboard()
-            )
+            await pro_cmd(update, context)
             return
         if kind == "buy":
             await buy_cmd(update, context)
@@ -946,17 +894,17 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_reminder(user_id, ticker, variant, when_ts)
         await query.message.reply_text(
             f"Готово! {date_iso} в 09:00 (МСК) я пересчитаю прогноз по {ticker} "
-            f"({ 'лучшая модель' if variant=='best' else 'ансамбль топ-3' if variant=='top3' else 'ансамбль всех моделей' }) "
+            f"({'лучшая модель' if variant == 'best' else 'ансамбль топ-3' if variant == 'top3' else 'ансамбль всех моделей'}) "
             f"на текущих данных и пришлю обновлённую рекомендацию."
         )
         return
-
 
 
 # --------------- Post-init (set commands) ---------------
 
 async def post_init(application):
     await application.bot.set_my_commands([
+        BotCommand("forecast", "Прогноз по тикеру / категории"),
         BotCommand("buy", "Оплата Pro-подписки"),
         BotCommand("pro", "Pro-подписка и Signal Mode"),
         BotCommand("status", "Ваш тариф и лимиты"),
@@ -981,7 +929,7 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .job_queue(jq)      # этого достаточно
+        .job_queue(jq)
         .build()
     )
 
@@ -989,7 +937,7 @@ def main():
 
     # хендлеры
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))  # ← добавили /help
+    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("forecast", forecast))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("stocks", stocks))
@@ -1055,11 +1003,9 @@ def main():
     app.run_polling()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user (Ctrl+C)")
-        import os
-        os._exit(0)   # жёстко завершаем процесс, без ожидания потоков
-
+        os._exit(0)

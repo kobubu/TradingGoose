@@ -179,11 +179,11 @@ async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("/pro from user_id=%s", u.id if u else None)
     msg = update.effective_message
     txt = (
-        "💎 *Pro-подписка*\n"
+        "💎 Pro-подписка\n"
         "Стоимость: 1 TON / месяц\n\n"
         "Преимущества:\n"
-        "• до *10 прогнозов в день* (вместо 3)\n"
-        "• *Signal Mode* — бот сам присылает лучшие прогнозы в 09:00 МСК\n"
+        "• до 10 прогнозов в день (вместо 3)\n"
+        "• Signal Mode — бот сам присылает лучшие прогнозы в 09:00 МСК\n"
         "• поддержка напоминаний и расширенных функций\n\n"
         "📡 Режимы Signal Mode:\n"
         "• /signal_all — все категории (акции, крипта, форекс)\n"
@@ -197,7 +197,8 @@ async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Для оплаты используйте команду /buy\n"
         "После активации — включите сигналы: /signal_on"
     )
-    await msg.reply_text(txt, parse_mode="Markdown", reply_markup=category_keyboard())
+    await msg.reply_text(txt, reply_markup=category_keyboard())
+
 
 
 async def signal_on(update: Update, context: ContextTypes.DEFAULT_TYPE):

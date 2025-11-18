@@ -54,7 +54,6 @@ CRYPTO_MAP: Dict[str, str] = {
     "MKR":  "MKR-USD",
     "LDO":  "LDO-USD",
     "STX":  "STX-USD",
-    "IMX":  "IMX-USD",
     "SEI":  "SEI-USD",
     "PYTH": "PYTH-USD",
     "WIF":  "WIF-USD",
