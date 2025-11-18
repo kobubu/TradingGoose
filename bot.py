@@ -10,6 +10,7 @@ import uuid
 import numpy as np
 import sys
 from datetime import date as _date
+from concurrent.futures import ProcessPoolExecutor
 
 
 from dotenv import load_dotenv
@@ -31,7 +32,6 @@ from telegram.ext import (
     InlineQueryHandler,
     JobQueue, # ← добавили
 )
-
 
 
 # ---------- ENV ----------
@@ -81,7 +81,6 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 # --- env for bot token ---
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
 
@@ -151,6 +150,11 @@ def _no_inflight() -> bool:
 
 warmup.set_inflight_checker(_no_inflight)
 INFLIGHT_LOCK = asyncio.Lock()
+
+FORECAST_WORKERS = int(os.getenv("FORECAST_WORKERS", "2"))
+FORECAST_EXECUTOR = ProcessPoolExecutor(max_workers=FORECAST_WORKERS)
+
+logger.info("Using FORECAST_WORKERS=%s", FORECAST_WORKERS)
 
 # --------------- Forecast pipeline ---------------
 
@@ -348,12 +352,17 @@ async def _get_shared_forecast(df, resolved_ticker: str):
 
     if owner:
         try:
-            # тяжёлое обучение в отдельном треде
-            res = await asyncio.to_thread(
+            loop = asyncio.get_running_loop()
+
+            # 🔥 тяжёлая функция — сразу в process pool
+            # ВАЖНО: train_select_and_forecast — ТОП-ЛЕВЕЛ функция (в core.forecast)
+            res = await loop.run_in_executor(
+                FORECAST_EXECUTOR,
                 train_select_and_forecast,
                 df,
                 resolved_ticker,
             )
+
             fut.set_result(res)
             return res
         except Exception as e:
@@ -366,6 +375,8 @@ async def _get_shared_forecast(df, resolved_ticker: str):
     else:
         # просто ждём результат первого
         return await fut
+
+
 
 
 warmup.set_forecast_fn(_get_shared_forecast)
@@ -460,6 +471,7 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     u = update.effective_user
     logger.info("/forecast from user_id=%s args=%s", u.id if u else None, context.args)
+
     try:
         user_id = u.id if u else None
         if user_id is None:
@@ -484,13 +496,28 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_ticker = context.args[0].upper().strip()
         consume_one(user_id)
 
-        await _run_forecast_for(
-            ticker=user_ticker,
-            amount=DEFAULT_AMOUNT,
-            reply_text_fn=msg.reply_text,
-            reply_photo_fn=msg.reply_photo,
-            user_id=user_id
+        # 👉 быстрый ответ ВСЕГДА
+        await msg.reply_text(
+            f"✅ Запрос принят. Сейчас загружу данные по {user_ticker} и посчитаю прогноз.\n"
+            f"Это может занять несколько минут, я пришлю результат, когда буду готов.",
         )
+
+        # 👉 тяжёлая часть — в фоне
+        async def _job():
+            try:
+                await _run_forecast_for(
+                    ticker=user_ticker,
+                    amount=DEFAULT_AMOUNT,
+                    reply_text_fn=msg.reply_text,
+                    reply_photo_fn=msg.reply_photo,
+                    user_id=user_id
+                )
+            except Exception:
+                logger.exception("Error in forecast background task user_id=%s", user_id)
+                await msg.reply_text("Ошибка при построении прогноза.", reply_markup=category_keyboard())
+
+        context.application.create_task(_job())
+
     except Exception:
         logger.exception("Error in /forecast handler for user_id=%s", u.id if u else None)
         await msg.reply_text("Ошибка при обработке команды /forecast.", reply_markup=category_keyboard())
@@ -790,6 +817,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id if query.from_user else None
     logger.info("Callback from user_id=%s data=%s", user_id, data)
 
+    # ---------- Кнопка "Построить прогноз" ----------
     if data.startswith("forecast:"):
         warmup.mark_user_activity()
         ticker = data.split(":", 1)[1].strip().upper()
@@ -801,6 +829,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def reply_photo(photo, caption=None, **kwargs):
             await query.message.reply_photo(photo=photo, caption=caption, **kwargs)
 
+        # Проверка лимитов как раньше
         if user_id is not None and not can_consume(user_id):
             lim = get_limits(user_id)
             logger.info("User %s hit daily limit on inline forecast; limit=%s", user_id, lim)
@@ -811,18 +840,41 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=pro_cta_keyboard()
             )
             return
+
         if user_id is not None:
             consume_one(user_id)
 
-        await _run_forecast_for(
-            ticker=ticker,
-            amount=amount,
-            reply_text_fn=reply_text,
-            reply_photo_fn=reply_photo,
-            user_id=user_id
+        # ⚡️ МГНОВЕННЫЙ ОТВЕТ ПОЛЬЗОВАТЕЛЮ
+        await query.message.reply_text(
+            f"✅ Запрос по {ticker} принят.\n"
+            f"Считаю прогноз, это может занять некоторое время.\n"
+            f"Результат пришлю сюда, как только будет готов.",
         )
+
+        # 🧠 ТЯЖЁЛАЯ ЧАСТЬ — В ФОНЕ
+        async def _job():
+            try:
+                await _run_forecast_for(
+                    ticker=ticker,
+                    amount=amount,
+                    reply_text_fn=reply_text,
+                    reply_photo_fn=reply_photo,
+                    user_id=user_id
+                )
+            except Exception:
+                logger.exception("Error in inline forecast background task user_id=%s", user_id)
+                try:
+                    await query.message.reply_text(
+                        "Ошибка при построении прогноза.",
+                        reply_markup=category_keyboard()
+                    )
+                except Exception:
+                    pass
+
+        context.application.create_task(_job())
         return
 
+    # ---------- Меню ----------
     if data.startswith("menu:"):
         kind = data.split(":", 1)[1]
         logger.debug("Menu callback kind=%s user_id=%s", kind, user_id)
@@ -857,6 +909,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await fav_list_cmd(update, context)
             return
 
+    # ---------- Напоминания ----------
     if data.startswith("rmd:") or data.startswith("remind:"):
         parts = data.split(":")
         if len(parts) != 4:
@@ -897,6 +950,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"на текущих данных и пришлю обновлённую рекомендацию."
         )
         return
+
 
 
 # --------------- Post-init (set commands) ---------------

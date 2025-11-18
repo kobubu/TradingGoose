@@ -25,6 +25,9 @@ MODEL_VERSION = "v2"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 
+# 🔧 флаг для управления ансамблями: 1 — включены, 0 — выключены
+ENSEMBLES_ENABLED = os.getenv("ENSEMBLES_ENABLED", "1") == "1"
+
 # Куда складываем статистику по моделям
 STATS_PATH = (
     Path(__file__).resolve().parent.parent / "artifacts" / "models_stats.csv"
@@ -490,21 +493,27 @@ def train_select_and_forecast(
             except Exception:
                 logger.exception("Error using cached LSTM model for %s", ticker)
 
-    # ---------- 4. Если best есть из кэша: считаем ансамбли и сохраняем три прогноза ----------
+    # ---------- 4. Если best есть из кэша: считаем/не считаем ансамбли и сохраняем три прогноза ----------
     if fcst_best_df is not None:
-        _, candidates = select_and_fit_with_candidates(
-            y,
-            val_steps=val_steps,
-            horizon=WF_HORIZON,
-            eval_tag=ticker,
-            save_plots=False,
-        )
-        fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
-            y, candidates, future_idx
-        )
-        if fcst_avg_all_df.empty:
+        if ENSEMBLES_ENABLED:
+            # считаем кандидатов и ансамбли
+            _, candidates = select_and_fit_with_candidates(
+                y,
+                val_steps=val_steps,
+                horizon=WF_HORIZON,
+                eval_tag=ticker,
+                save_plots=False,
+            )
+            fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
+                y, candidates, future_idx
+            )
+            if fcst_avg_all_df.empty:
+                fcst_avg_all_df = fcst_best_df.copy()
+            if fcst_avg_top3_df.empty:
+                fcst_avg_top3_df = fcst_best_df.copy()
+        else:
+            # ⚡️ ансамбли выключены — используем best как proxy для avg_all и avg_top3
             fcst_avg_all_df = fcst_best_df.copy()
-        if fcst_avg_top3_df.empty:
             fcst_avg_top3_df = fcst_best_df.copy()
 
         _save_three(
@@ -515,10 +524,10 @@ def train_select_and_forecast(
             fcst_avg_top3_df,
         )
         models_logger.info(
-            "Using cached BEST model=%s for %s (fresh), rmse=%.4f",
+            "Using cached BEST model=%s for %s (ENSEMBLES_ENABLED=%s)",
             best_dict.get("name") or "cached",
             (ticker or "N/A"),
-            float(metrics.get("rmse") or float("nan")),
+            ENSEMBLES_ENABLED,
         )
         return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
@@ -575,12 +584,17 @@ def train_select_and_forecast(
     fcst_best_df = pd.DataFrame({"forecast": y_fcst_30.values}, index=future_idx)
 
     # Ансамбли
-    fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
-        y, candidates, future_idx
-    )
-    if fcst_avg_all_df.empty:
+    if ENSEMBLES_ENABLED:
+        fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
+            y, candidates, future_idx
+        )
+        if fcst_avg_all_df.empty:
+            fcst_avg_all_df = fcst_best_df.copy()
+        if fcst_avg_top3_df.empty:
+            fcst_avg_top3_df = fcst_best_df.copy()
+    else:
+        # ⚡️ ансамбли выключены — просто копируем лучший прогноз
         fcst_avg_all_df = fcst_best_df.copy()
-    if fcst_avg_top3_df.empty:
         fcst_avg_top3_df = fcst_best_df.copy()
 
     # Метрики
@@ -689,9 +703,10 @@ def train_select_and_forecast(
         logger.exception("Failed to log model stats for ticker=%s", ticker)
 
     logger.info(
-        "Trained from scratch: ticker=%s winner=%s rmse=%.4f",
+        "Trained from scratch: ticker=%s winner=%s rmse=%.4f (ENSEMBLES_ENABLED=%s)",
         ticker,
         best_dict["name"],
         metrics["rmse"] if metrics["rmse"] is not None else float("nan"),
+        ENSEMBLES_ENABLED,
     )
     return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
