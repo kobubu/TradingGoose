@@ -11,7 +11,8 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from core.data import load_ticker_history, resolve_user_ticker, MAIN_CRYPTO, MAIN_FOREX
-from core.forecast import train_select_and_forecast, make_plot_image
+from core.forecast import train_select_and_forecast
+from core.plot_utils import export_plot_pdf, make_plot_image
 from core.recommend import generate_recommendations
 from core.subs import (
     get_status, set_signal, is_pro, get_limits,

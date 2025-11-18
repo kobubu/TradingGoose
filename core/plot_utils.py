@@ -4,13 +4,14 @@ import matplotlib
 matplotlib.use("Agg")  # безопасный backend без GUI
 import matplotlib.pyplot as plt
 import pandas as pd
+from typing import Optional, List
 
 
 def make_plot_image(
     history_df: pd.DataFrame,
     forecast_df: pd.DataFrame,
     ticker: str,
-    markers: list | None = None,  # оставлено для совместимости, пока не используем
+    markers: Optional[List] = None,  # оставлено для совместимости, пока не используем
     title_suffix: str = "",
 ) -> io.BytesIO:
     """
