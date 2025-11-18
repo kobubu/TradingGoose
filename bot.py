@@ -8,7 +8,9 @@ import logging
 import json
 import uuid
 import numpy as np
+import sys
 from datetime import date as _date
+
 
 from dotenv import load_dotenv
 
@@ -80,6 +82,8 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 # --- env for bot token ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
 
 # --- constants used in this module ---
 CAPTION_MAX = 1024
@@ -87,7 +91,6 @@ TEXT_MAX = 4096
 
 # --- core imports ---
 from core.data import load_ticker_history, resolve_user_ticker
-from core.forecast import export_plot_pdf, make_plot_image, train_select_and_forecast
 from core.logging_utils import log_request
 from core.recommend import generate_recommendations
 from core.subs import (
@@ -95,13 +98,8 @@ from core.subs import (
     set_tier, pro_users_for_signal,
     set_signal_cats, get_signal_cats, set_signal_list, get_signal_list
 )
-from core.forecast import (
-    export_plot_pdf,
-    make_plot_image,
-    train_select_and_forecast,
-    _make_data_signature,   # ← добавили
-)
-
+from core.forecast import train_select_and_forecast, _make_data_signature
+from core.plot_utils import export_plot_pdf, make_plot_image
 from core.reminders import init_reminders, add_reminder, count_active, due_for_day, mark_sent
 from core import model_cache
 from core.favorites import get_favorites, add_favorite, remove_favorite
@@ -746,6 +744,41 @@ async def error_handler(update, context):
     logger.exception("Unhandled error in application: %s", err)
 
 
+# --------------- Shutdown and restart handlers ---------------
+
+async def shutdown_cmd(update, context):
+    u = update.effective_user
+    msg = update.effective_message
+
+    if not u or u.id != BOT_OWNER_ID:
+        await msg.reply_text("Эта команда только для владельца бота.")
+        return
+
+    logger.info("Shutdown requested by owner user_id=%s", u.id)
+    await msg.reply_text("🛑 Останавливаю бота…")
+
+    await asyncio.sleep(0.3)
+    await context.application.stop()
+    logger.info("Exiting process with os._exit(0) after /shutdown")
+    os._exit(0)
+
+async def restart_cmd(update, context):
+    u = update.effective_user
+    msg = update.effective_message
+
+    if not u or u.id != BOT_OWNER_ID:
+        await msg.reply_text("Эта команда только для владельца бота.")
+        return
+
+    await msg.reply_text("🔁 Перезапускаю бота…")
+    await asyncio.sleep(0.3)
+
+    await context.application.stop()
+
+    import os, sys
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 # --------------- Callback handler ---------------
 
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -931,6 +964,8 @@ def main():
     app.add_handler(CommandHandler("fav_add", fav_add_cmd))
     app.add_handler(CommandHandler("fav_remove", fav_remove_cmd))
     app.add_handler(InlineQueryHandler(inline_query_handler))
+    app.add_handler(CommandHandler("shutdown", shutdown_cmd))
+    app.add_handler(CommandHandler("restart", restart_cmd))
     app.add_error_handler(error_handler)
 
     # джобы
@@ -971,3 +1006,6 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user (Ctrl+C)")
+        import os
+        os._exit(0)   # жёстко завершаем процесс, без ожидания потоков
+
