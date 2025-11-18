@@ -117,21 +117,53 @@ async def signal_forex_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def signal_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /signal_custom AAPL,MSFT,BTC,EURUSD
-    """
+    msg = update.effective_message
     u = update.effective_user
-    logger.info("signal_custom by user_id=%s args=%s", u.id if u else None, context.args)
-    if not is_pro(u.id):
-        await update.effective_message.reply_text("Опция доступна только Pro. /pro")
+    user_id = u.id
+
+    if not context.args:
+        await msg.reply_text(
+            "Введите список тикеров, например:\n"
+            "/signal_custom AAPL,MSFT,BTC,EURUSD"
+        )
         return
-    args = " ".join(context.args).strip()
-    if not args:
-        await update.effective_message.reply_text("Использование: /signal_custom <тикеры через запятую>")
+
+    raw = " ".join(context.args)
+    raw = raw.replace(";", ",").replace(" ", ",")
+
+    user_items = [t.strip().upper() for t in raw.split(",") if t.strip()]
+    resolved_items = []
+    invalid = []
+
+    for t in user_items:
+        try:
+            resolved = resolve_user_ticker(t)
+            resolved_items.append(resolved)
+        except Exception:
+            invalid.append(t)
+
+    if invalid:
+        await msg.reply_text(
+            "❗ Следующие тикеры не поддерживаются:\n"
+            + ", ".join(invalid)
+            + "\n\nПроверьте правильность или выберите тикеры из /stocks, /crypto или /forex."
+        )
         return
-    set_signal_cats(u.id, "custom")
-    set_signal_list(u.id, args)
-    await update.effective_message.reply_text(f"Signal Mode: выбранные тикеры ✅\nСписок: {args}")
+
+    if not resolved_items:
+        await msg.reply_text("Не удалось распознать ни одного тикера.")
+        return
+
+    # сохраняем только корректные
+    set_signal_list(user_id, resolved_items)
+    set_signal_cats(user_id, "custom")
+
+    await msg.reply_text(
+        "Готово! Кастомный список обновлён:\n"
+        + ", ".join(resolved_items)
+        + "\n\nЕжедневные сигналы будут приходить только по этим тикерам.\n"
+          "Чтобы включить рассылку: /signal_on"
+    )
 
 
 # --------------- Status / Pro info ---------------
@@ -182,9 +214,10 @@ async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💎 Pro-подписка\n"
         "Стоимость: 1 TON / месяц\n\n"
         "Преимущества:\n"
-        "• до 10 прогнозов в день (вместо 3)\n"
+        "• до 20 прогнозов в день (вместо 3)\n"
         "• Signal Mode — бот сам присылает лучшие прогнозы в 09:00 МСК\n"
         "• поддержка напоминаний и расширенных функций\n\n"
+        "• больше и лучше модели\n"
         "📡 Режимы Signal Mode:\n"
         "• /signal_all — все категории (акции, крипта, форекс)\n"
         "• /signal_stocks_only — только акции\n"

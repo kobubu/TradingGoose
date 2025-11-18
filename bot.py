@@ -175,6 +175,9 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
 
         logger.debug("History loaded: ticker=%s len=%d last_dt=%s", resolved, len(df), df.index[-1])
 
+        # базовая цена — текущий Close
+        last_close = float(df['Close'].iloc[-1])
+
         # 2) общий расчёт для всех конкурентных запросов к этому df/ticker
         best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df = await _get_shared_forecast(df, resolved)
 
@@ -185,7 +188,10 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
 
         # 3) рекомендации — только по лучшей модели
         rec_best, profit_best, markers_best = generate_recommendations(
-            fcst_best_df, amount, model_rmse=metrics.get('rmse') if metrics else None
+            fcst_best_df,
+            amount,
+            model_rmse=metrics.get('rmse') if metrics else None,
+            baseline_price=last_close,
         )
 
         # 4) картинка только по лучшей модели
@@ -208,9 +214,8 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
         except Exception as e:
             logger.warning("PDF export failed for ticker=%s: %s", resolved, e)
 
-        # 6) дельта по лучшему прогнозу
-        last_close = float(df["Close"].iloc[-1])
-        delta_best = ((fcst_best_df["forecast"].iloc[-1] - last_close) / last_close) * 100.0
+        # 6) дельта по лучшему прогнозу — по той же базе last_close
+        delta_best = ((fcst_best_df['forecast'].iloc[-1] - last_close) / last_close) * 100.0
 
         # 7) подпись
         cap_best = (
@@ -264,7 +269,7 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
                 if st.get("tier") != "pro":
                     tip = (
                         f"Сегодня осталось прогнозов: {remaining}. "
-                        f"Проапгрейд до Pro (1 TON/мес) — 10/день + ежедневные сигналы. "
+                        f"Проапгрейд до Pro (1 TON/мес) — 20/день + ежедневные сигналы. "
                         f"Команды: /pro • /buy • /signal_on"
                     )
                     await reply_text_fn(tip, reply_markup=pro_cta_keyboard())
@@ -436,7 +441,7 @@ async def forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("User %s hit daily limit=%s", user_id, lim)
             await msg.reply_text(
                 f"Лимит исчерпан. Ваш дневной лимит: {lim}.\n\n"
-                "💎 Pro-подписка: 1 TON/мес — 10 прогнозов в день + ежедневные сигналы.\n"
+                "💎 Pro-подписка: 1 TON/мес — 20 прогнозов в день + ежедневные сигналы.\n"
                 "Нажмите кнопку ниже, чтобы узнать больше 👇",
                 reply_markup=pro_cta_keyboard()
             )
@@ -786,7 +791,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("User %s hit daily limit on inline forecast; limit=%s", user_id, lim)
             await query.message.reply_text(
                 f"Лимит исчерпан. Ваш дневной лимит: {lim}.\n\n"
-                "💎 Pro-подписка: 1 TON/мес — 10 прогнозов в день + ежедневные сигналы.\n"
+                "💎 Pro-подписка: 1 TON/мес — 20 прогнозов в день + ежедневные сигналы.\n"
                 "Нажмите кнопку ниже, чтобы узнать больше 👇",
                 reply_markup=pro_cta_keyboard()
             )
