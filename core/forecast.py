@@ -21,7 +21,7 @@ from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 logger = logging.getLogger(__name__)
 models_logger = logging.getLogger("models")
 
-MODEL_VERSION = "v5"
+MODEL_VERSION = "v1"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 ENSEMBLES_ENABLED = os.getenv("ENSEMBLES_ENABLED", "1") == "1"
@@ -82,41 +82,55 @@ FC_MIN_MULT = float(os.getenv("FC_MIN_MULT", "0.2"))  # мин. ×0.2
 FC_MAX_DAILY_CHG = float(os.getenv("FC_MAX_DAILY_CHG", "0.5"))  # макс. дневной скачок 50%
 
 
-def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> Optional[np.ndarray]:
+def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> np.ndarray:
+    """
+    Мягкая санитизация:
+    - убираем NaN/inf
+    - запрещаем нули/отрицательные
+    - ограничиваем очень дикие выносы по мультипликаторам
+    НИКОГДА не возвращаем None, только массив.
+    """
     arr = np.asarray(arr, dtype=float)
 
-    # 1) базовая проверка на NaN/inf
-    if arr.size == 0 or not np.all(np.isfinite(arr)):
-        return None
-
-    if not np.isfinite(last_close) or last_close <= 0:
-        return None
-
-    # 2) запрет на нулевые/отрицательные цены
-    if np.any(arr <= 0):
-        return None
-
-    # 3) очень мягкие границы, только от совсем выноса в космос
-    lo = last_close * FC_MIN_MULT   # но FC_MIN_MULT сделай чем-то типа 0.01
-    hi = last_close * FC_MAX_MULT   # а FC_MAX_MULT — 50 или 100
-
-    if np.min(arr) < lo or np.max(arr) > hi:
-        # считаем действительно поехавшим
-        return None
-
-    # 4) ДНЕВНЫЕ СКАЧКИ НЕ РУБИМ ЖЁСТКО
-    # можно либо вообще убрать этот блок, либо сильно ослабить:
-    rel = np.diff(arr) / arr[:-1]
-    if np.any(np.abs(rel) > FC_MAX_DAILY_CHG):
-        # если сильно нервничаешь — логируем, но НЕ превращаем в flat
-        logger.warning(
-            "Forecast has big daily moves (max=%.2f). Leaving as is.",
-            float(np.max(np.abs(rel)))
-        )
-        # и просто возвращаем arr без обнуления
+    if arr.size == 0:
         return arr
 
+    # 1) NaN / inf → last_close
+    if not np.isfinite(last_close) or last_close <= 0:
+        # пытаемся взять адекватный базовый уровень из самого прогноза
+        finite_pos = arr[np.isfinite(arr) & (arr > 0)]
+        if finite_pos.size > 0:
+            last_close = float(finite_pos[-1])
+        else:
+            last_close = 1.0
+
+    arr = np.nan_to_num(arr, nan=last_close, posinf=last_close, neginf=last_close)
+
+    # 2) не даём нулевые/отрицательные цены
+    arr[arr <= 0] = last_close
+
+    # 3) мягкие границы по мультипликаторам (но уже без выкидывания прогноза)
+    lo = last_close * FC_MIN_MULT
+    hi = last_close * FC_MAX_MULT
+    arr = np.clip(arr, lo, hi)
+
+    # 4) большие дневные скачки только логируем (можно раскомментить сглаживание)
+    rel = np.diff(arr) / arr[:-1]
+    max_jump = float(np.max(np.abs(rel))) if rel.size > 0 else 0.0
+    if max_jump > FC_MAX_DAILY_CHG:
+        logger.warning(
+            "Forecast has big daily moves (max=%.2f > FC_MAX_DAILY_CHG=%.2f) — оставляем как есть.",
+            max_jump,
+            FC_MAX_DAILY_CHG,
+        )
+        # Если захочешь сглаживать, можно вот так:
+        # for i in range(1, len(arr)):
+        #     r = (arr[i] - arr[i-1]) / arr[i-1]
+        #     if abs(r) > FC_MAX_DAILY_CHG:
+        #         arr[i] = arr[i-1] * (1.0 + np.sign(r) * FC_MAX_DAILY_CHG)
+
     return arr
+
 
 
 # ---------- Ансамбли ----------

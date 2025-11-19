@@ -150,46 +150,7 @@ async def warmup_one() -> None:
         # по-любому очищаем
         WARMUP_CURRENT_TICKER = None
 
-    if _inflight_checker is not None and not _inflight_checker():
-        # есть активные train_select_and_forecast — подождём
-        return
-
-    if _forecast_fn is None:
-        # ещё не зарегистрировали исполнитель — ничего не делаем
-        return
-
-    now = time.time()
-    if now - LAST_USER_ACTIVITY_TS < IDLE_SEC_FOR_WARMUP:
-        # недавно была активность — не мешаем реальным пользователям
-        return
-
-    if not WARMUP_TICKERS:
-        return
-
-    # выбираем следующий тикер по кругу
-    async with WARMUP_LOCK:
-        ticker = WARMUP_TICKERS[WARMUP_INDEX % len(WARMUP_TICKERS)]
-        WARMUP_INDEX += 1
-
-    try:
-        resolved = resolve_user_ticker(ticker)
-    except Exception:
-        resolved = ticker
-
-    df = load_ticker_history(resolved)
-    if df is None or df.empty:
-        logger.warning("warmup: no data for ticker=%s (resolved=%s)", ticker, resolved)
-        return
-
-    logger.info("warmup: start for %s", resolved)
-
-    try:
-        # _forecast_fn — это _get_shared_forecast из bot.py,
-        # он сам позовёт train_select_and_forecast и использует общий реестр INFLIGHT_FORECASTS.
-        await _forecast_fn(df, resolved)
-        logger.info("warmup: done for %s", resolved)
-    except Exception:
-        logger.exception("warmup: failed for ticker=%s", resolved)
+    
 
 
 async def warmup_job(context) -> None:
