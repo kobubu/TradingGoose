@@ -21,7 +21,7 @@ from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 logger = logging.getLogger(__name__)
 models_logger = logging.getLogger("models")
 
-MODEL_VERSION = "v3"
+MODEL_VERSION = "v4"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 ENSEMBLES_ENABLED = os.getenv("ENSEMBLES_ENABLED", "1") == "1"
@@ -205,6 +205,63 @@ def _is_fresh(meta: Dict[str, Any], ttl: int) -> bool:
     except Exception:
         return False
 
+# forecast.py
+
+def load_cached_forecasts_if_fresh(
+    df: pd.DataFrame,
+    ticker: Optional[str],
+    ttl: Optional[int] = None,
+) -> Optional[Tuple[Dict, Dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Быстрая попытка достать 3 прогноза (best / avg_all / avg_top3) из кэша.
+    НИЧЕГО не обучает и не трогает модели.
+
+    Возвращает:
+      (best_dict, metrics, fb, fa, ft)
+    или None, если кэш отсутствует / устарел / невалиден.
+    """
+    if not ticker:
+        return None
+
+    if ttl is None:
+        ttl = MODEL_CACHE_TTL_SECONDS
+
+    y = df["Close"].astype(float)
+    data_sig = _make_data_signature(df)
+    fc_key = model_cache.make_forecasts_key(ticker or "N/A", data_sig)
+
+    fb, fa, ft, fmeta = model_cache.load_forecasts(fc_key)
+    if fb is None or fa is None or ft is None or fmeta is None:
+        return None
+
+    last_close = float(y.iloc[-1])
+    arr = fb["forecast"].values.astype(float)
+    arr_ok = _sanitize_forecast_array(arr, last_close)
+
+    if (
+        _is_fresh(fmeta, ttl)
+        and fmeta.get("data_sig") == data_sig
+        and arr_ok is not None
+    ):
+        logger.info("Forecasts cache HIT (fast path) for %s", ticker)
+        models_logger.info(
+            "Using cached FORECASTS (fast) for %s: best=%s rmse=%.4f",
+            (ticker or "N/A"),
+            fmeta.get("best_name", "cached_best"),
+            float((fmeta.get("metrics") or {}).get("rmse") or float("nan")),
+        )
+
+        fb = fb.copy()
+        fb["forecast"] = arr_ok
+
+        best_dict = {"name": fmeta.get("best_name", "cached_best")}
+        metrics = fmeta.get("metrics", {"rmse": None, "mape": None})
+        return best_dict, metrics, fb, fa, ft
+
+    logger.info("Forecasts cache for %s is stale/insane → ignore", ticker)
+    return None
+
+
 
 def _make_config_id(model_name: str, extra: Optional[dict]) -> str:
     """Стабильный идентификатор конфигурации модели."""
@@ -299,7 +356,14 @@ def train_select_and_forecast(
     val_steps = min(30, max(10, len(y) // 10))
     future_idx = _make_future_index(df.index[-1], 30, ticker or "")
 
-    # 1) считаем сигнатуру и ключи кэша
+    # ---------- 1. Быстрый путь: пробуем взять ГОТОВЫЕ forecasts из кэша ----------
+    if ticker and not force_retrain:
+        cached = load_cached_forecasts_if_fresh(df, ticker, MODEL_CACHE_TTL_SECONDS)
+        if cached is not None:
+            # cached уже (best_dict, metrics, fb, fa, ft)
+            return cached
+
+    # ---------- 2. Считаем сигнатуру и ключи кэша моделей/forecasts ----------
     data_sig = _make_data_signature(df)
     params = {
         "val_steps": val_steps,
@@ -320,46 +384,13 @@ def train_select_and_forecast(
     except Exception:
         pass
 
-    # ---------- 2. Пробуем достать 3 прогноза из кэша ----------
-    if ticker and not force_retrain:
-        fb, fa, ft, fmeta = model_cache.load_forecasts(fc_key)
-        if fb is not None and fa is not None and ft is not None and fmeta is not None:
-            last_close = float(df["Close"].iloc[-1])
-
-            # sanity-check кэшированного best-прогноза
-            arr = fb["forecast"].values.astype(float)
-            arr_ok = _sanitize_forecast_array(arr, last_close)
-
-            if (
-                _is_fresh(fmeta, MODEL_CACHE_TTL_SECONDS)
-                and fmeta.get("data_sig") == data_sig
-                and arr_ok is not None
-            ):
-                logger.info("Forecasts cache HIT (fresh + sane) for %s", ticker)
-                best_dict = {"name": fmeta.get("best_name", "cached_best")}
-                metrics = fmeta.get("metrics", {"rmse": None, "mape": None})
-                models_logger.info(
-                    "Using cached FORECASTS for %s: best=%s rmse=%.4f",
-                    (ticker or "N/A"),
-                    fmeta.get("best_name", "cached_best"),
-                    float((fmeta.get("metrics") or {}).get("rmse") or float("nan")),
-                )
-                fb = fb.copy()
-                fb["forecast"] = arr_ok
-                return best_dict, metrics, fb, fa, ft
-            else:
-                logger.info(
-                    "Forecasts cache for %s is stale or insane → recompute", ticker
-                )
-
-    # ---------- 3. Пробуем достать модель-победителя из кэша ----------
+    # ---------- 3. Подготовка общих структур ----------
     best_dict: Dict[str, Optional[str]] = {"name": None}
     metrics: Dict[str, Optional[float]] = {"rmse": None, "mape": None}
     fcst_best_df: Optional[pd.DataFrame] = None
     fcst_avg_all_df: Optional[pd.DataFrame] = None
     fcst_avg_top3_df: Optional[pd.DataFrame] = None
 
-    # последняя цена — нужна для sanity-check прогнозов из кэшированных моделей
     try:
         last_close = float(y.iloc[-1])
     except Exception:
@@ -382,12 +413,12 @@ def train_select_and_forecast(
         }
         model_cache.save_forecasts(fc_key, fb, fa, ft, meta)
 
-    # --- sklearn (RF) ---
+    # ---------- 4. Пытаемся использовать кэш МОДЕЛЕЙ (RF / SARIMAX / LSTM) ----------
+
+    # --- sklearn (RandomForest) ---
     if ticker and not force_retrain:
         skl_model, skl_meta = model_cache.load_sklearn_model(model_key)
-        if skl_model is not None and _is_fresh(
-            skl_meta or {}, MODEL_CACHE_TTL_SECONDS
-        ):
+        if skl_model is not None and _is_fresh(skl_meta or {}, MODEL_CACHE_TTL_SECONDS):
             try:
                 lag = int((skl_meta.get("extra") or {}).get("lag", 30))
                 arr = y.values.astype(float)
@@ -494,10 +525,9 @@ def train_select_and_forecast(
             except Exception:
                 logger.exception("Error using cached LSTM model for %s", ticker)
 
-        # ---------- 4. Если best есть из кэша: считаем / не считаем ансамбли и сохраняем три прогноза ----------
+    # ---------- 5. Если best уже есть (из кэша модели) – считаем/не считаем ансамбли, сохраняем три прогноза ----------
     if fcst_best_df is not None:
         if ENSEMBLES_ENABLED:
-            # как раньше — считаем кандидатов и ансамбли
             _, candidates = select_and_fit_with_candidates(
                 y,
                 val_steps=val_steps,
@@ -513,7 +543,6 @@ def train_select_and_forecast(
             if fcst_avg_top3_df.empty:
                 fcst_avg_top3_df = fcst_best_df.copy()
         else:
-            # ансамбли выключены — просто используем лучший прогноз как proxy
             fcst_avg_all_df = fcst_best_df.copy()
             fcst_avg_top3_df = fcst_best_df.copy()
 
@@ -532,8 +561,7 @@ def train_select_and_forecast(
         )
         return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
-
-    # ---------- 5. Обучение с нуля ----------
+    # ---------- 6. Обучение с нуля (нет ни прогнозов, ни пригодных кэш-моделей) ----------
     best, candidates = select_and_fit_with_candidates(
         y,
         val_steps=val_steps,
@@ -584,7 +612,7 @@ def train_select_and_forecast(
 
     y_fcst_30 = pd.Series(sanitized, index=future_idx)
     fcst_best_df = pd.DataFrame({"forecast": y_fcst_30.values}, index=future_idx)
-    
+
     if ENSEMBLES_ENABLED:
         fcst_avg_all_df, fcst_avg_top3_df = _build_ensembles_from_candidates(
             y, candidates, future_idx
@@ -594,7 +622,6 @@ def train_select_and_forecast(
         if fcst_avg_top3_df.empty:
             fcst_avg_top3_df = fcst_best_df.copy()
     else:
-        # ансамбли выключены — оба варианта равны лучшей модели
         fcst_avg_all_df = fcst_best_df.copy()
         fcst_avg_top3_df = fcst_best_df.copy()
 
@@ -620,7 +647,7 @@ def train_select_and_forecast(
     best_dict = {"name": best.name}
     metrics = {"rmse": float(rmse), "mape": float(mape) if mape == mape else None}
 
-    # ---------- 6. Сохраняем модель-победителя и три прогноза ----------
+    # ---------- 7. Сохраняем модель-победителя и три прогноза ----------
     try:
         if ticker:
             meta_model = {
@@ -680,7 +707,7 @@ def train_select_and_forecast(
     except Exception:
         logger.exception("Saving model/forecasts failed for %s", ticker)
 
-    # Записываем статистику эффективности победившей модели
+    # ---------- 8. Логируем статистику победившей модели ----------
     try:
         model_type = None
         extra = getattr(best, "extra", None)

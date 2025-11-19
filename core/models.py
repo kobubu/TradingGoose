@@ -77,6 +77,37 @@ ART_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "artifacts")
 os.makedirs(ART_DIR, exist_ok=True)
 
 
+# Пороговые коэффициенты — можно вынести в .env
+FC_MAX_MULT = float(os.getenv("FC_MAX_MULT", "5.0"))     # максимум x5 от последней цены
+FC_MIN_MULT = float(os.getenv("FC_MIN_MULT", "0.2"))     # минимум x0.2
+FC_MAX_DAILY_CHG = float(os.getenv("FC_MAX_DAILY_CHG", "0.5"))  # макс. |изменение| 50% в день
+
+def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> Optional[np.ndarray]:
+    """Фильтрует/валидирует 30-дневный прогноз. Если он «поехавший» — возвращает None."""
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return None
+
+    # запрет на нулевые/отрицательные цены
+    if np.any(arr <= 0):
+        return None
+
+    lo = last_close * FC_MIN_MULT
+    hi = last_close * FC_MAX_MULT
+
+    # слишком далеко от последней цены
+    if np.min(arr) < lo or np.max(arr) > hi:
+        return None
+
+    # слишком дикие дневные скачки
+    rel = np.diff(arr) / arr[:-1]
+    if np.any(np.abs(rel) > FC_MAX_DAILY_CHG):
+        return None
+
+    return arr
+
+
+
 def _pad_to_val_steps(preds, val_steps, fill_value):
     """Дополняет прогнозы до нужной длины fill_value"""
     preds = np.asarray(preds, dtype=float)

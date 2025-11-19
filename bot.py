@@ -94,7 +94,8 @@ from core.subs import (
     set_tier, pro_users_for_signal,
     set_signal_cats, get_signal_cats, set_signal_list, get_signal_list
 )
-from core.forecast import train_select_and_forecast, _make_data_signature
+from core.forecast import train_select_and_forecast, _make_data_signature, load_cached_forecasts_if_fresh
+
 from core.plot_utils import export_plot_pdf, make_plot_image
 from core.reminders import init_reminders, add_reminder, count_active, due_for_day, mark_sent
 from core import model_cache
@@ -288,9 +289,20 @@ async def _get_shared_forecast(df, resolved_ticker: str):
     Гарантирует, что для одного и того же df/ticker одновременно
     считается только ОДИН train_select_and_forecast.
 
-    Возвращает тот же кортеж, что train_select_and_forecast:
-      best, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
+    Но если прогноз уже есть в кэше и свежий — отдаём его сразу,
+    БЕЗ process pool и очереди.
     """
+
+    # ---------- 0. Быстрая проверка кэша прогнозов ----------
+    try:
+        cached = load_cached_forecasts_if_fresh(df, resolved_ticker)
+        if cached is not None:
+            # cached = (best, metrics, fb, fa, ft)
+            return cached
+    except Exception:
+        logger.exception("Fast cache check failed for ticker=%s", resolved_ticker)
+
+    # ---------- 1. Если в кэше нет — синхронизация по сигнатуре ----------
     sig = _make_data_signature(df)
 
     async with INFLIGHT_LOCK:
@@ -326,6 +338,7 @@ async def _get_shared_forecast(df, resolved_ticker: str):
     else:
         # просто ждём результат первого
         return await fut
+
 
 
 warmup.set_forecast_fn(_get_shared_forecast)
