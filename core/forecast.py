@@ -21,7 +21,7 @@ from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 logger = logging.getLogger(__name__)
 models_logger = logging.getLogger("models")
 
-MODEL_VERSION = "v1"
+MODEL_VERSION = "v4"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 ENSEMBLES_ENABLED = os.getenv("ENSEMBLES_ENABLED", "1") == "1"
@@ -84,52 +84,61 @@ FC_MAX_DAILY_CHG = float(os.getenv("FC_MAX_DAILY_CHG", "0.5"))  # макс. дн
 
 def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> np.ndarray:
     """
-    Мягкая санитизация:
-    - убираем NaN/inf
-    - запрещаем нули/отрицательные
-    - ограничиваем очень дикие выносы по мультипликаторам
-    НИКОГДА не возвращаем None, только массив.
+    Мягкая санитизация прогноза:
+    - заменяем NaN/inf на last_close
+    - убираем нули/отрицательные цены
+    - режем экстремальные уровни по FC_MIN_MULT / FC_MAX_MULT
+    - МЯГКО ограничиваем дневной скачок по FC_MAX_DAILY_CHG
+    НИКОГДА не возвращаем None, только откорректированный массив.
     """
     arr = np.asarray(arr, dtype=float)
 
     if arr.size == 0:
         return arr
 
-    # 1) NaN / inf → last_close
+    # 1) базовый уровень
     if not np.isfinite(last_close) or last_close <= 0:
-        # пытаемся взять адекватный базовый уровень из самого прогноза
         finite_pos = arr[np.isfinite(arr) & (arr > 0)]
         if finite_pos.size > 0:
             last_close = float(finite_pos[-1])
         else:
             last_close = 1.0
 
+    # 2) NaN/inf → last_close
     arr = np.nan_to_num(arr, nan=last_close, posinf=last_close, neginf=last_close)
 
-    # 2) не даём нулевые/отрицательные цены
+    # 3) не даём нулевые/отрицательные цены
     arr[arr <= 0] = last_close
 
-    # 3) мягкие границы по мультипликаторам (но уже без выкидывания прогноза)
+    # 4) мягкие границы по мультипликаторам
     lo = last_close * FC_MIN_MULT
     hi = last_close * FC_MAX_MULT
     arr = np.clip(arr, lo, hi)
 
-    # 4) большие дневные скачки только логируем (можно раскомментить сглаживание)
-    rel = np.diff(arr) / arr[:-1]
-    max_jump = float(np.max(np.abs(rel))) if rel.size > 0 else 0.0
-    if max_jump > FC_MAX_DAILY_CHG:
-        logger.warning(
-            "Forecast has big daily moves (max=%.2f > FC_MAX_DAILY_CHG=%.2f) — оставляем как есть.",
-            max_jump,
-            FC_MAX_DAILY_CHG,
-        )
-        # Если захочешь сглаживать, можно вот так:
-        # for i in range(1, len(arr)):
-        #     r = (arr[i] - arr[i-1]) / arr[i-1]
-        #     if abs(r) > FC_MAX_DAILY_CHG:
-        #         arr[i] = arr[i-1] * (1.0 + np.sign(r) * FC_MAX_DAILY_CHG)
+    # 5) МЯГКИЙ лимит по дневному изменению
+    if arr.size >= 2:
+        max_rel = FC_MAX_DAILY_CHG  # например, 0.5 = ±50% за день
+        for i in range(1, len(arr)):
+            prev = arr[i - 1]
+            if prev <= 0:
+                continue
+            r = (arr[i] - prev) / prev
+            if abs(r) > max_rel:
+                # обрезаем скачок до предельного
+                arr[i] = prev * (1.0 + np.sign(r) * max_rel)
+
+        # лог для диагностики
+        rel = np.diff(arr) / arr[:-1]
+        max_jump = float(np.max(np.abs(rel))) if rel.size > 0 else 0.0
+        if max_jump > max_rel * 0.9:  # почти у потолка
+            logger.warning(
+                "Forecast had big raw jumps, clipped to max |Δ|=%.2f (final max=%.2f)",
+                max_rel,
+                max_jump,
+            )
 
     return arr
+
 
 
 

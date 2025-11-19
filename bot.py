@@ -166,7 +166,7 @@ async def _run_forecast_for(ticker: str, amount: float, reply_text_fn, reply_pho
     try:
         # 1) резолвим тикер и грузим историю
         resolved = resolve_user_ticker(ticker)
-        await reply_text_fn(f"Загружаю данные для {resolved} и считаю прогноз. Может занять несколько минут…")
+        
 
         df = load_ticker_history(resolved)
         if df is None or df.empty:
