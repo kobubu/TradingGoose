@@ -21,7 +21,7 @@ from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 logger = logging.getLogger(__name__)
 models_logger = logging.getLogger("models")
 
-MODEL_VERSION = "v4"
+MODEL_VERSION = "v5"
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 ENSEMBLES_ENABLED = os.getenv("ENSEMBLES_ENABLED", "1") == "1"
