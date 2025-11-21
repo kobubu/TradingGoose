@@ -12,6 +12,8 @@ import time
 import joblib
 from typing import Optional, Tuple, Dict, Any
 
+# где у тебя лежат forecasts
+ART_DIR = Path(__file__).resolve().parent.parent / "artifacts" / "models"
 MODEL_ROOT = Path(__file__).resolve().parent.parent / "artifacts" / "models"
 MODEL_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -300,4 +302,40 @@ def load_latest_forecasts_for_ticker(ticker: str):
     return fb, fa, ft, latest_meta
 
 
+# ---------- Plots cache (PNG for forecasts) ----------
+
+_F_PLOT = "forecasts_plot.png"
+
+def _plot_path(fc_key: str) -> Path:
+    # PNG рядом с сохранёнными forecasts
+    return ART_DIR / fc_key / "forecast_plot.png"
+
+def save_plot(fc_key: str, png_bytes: bytes) -> None:
+    """
+    Сохраняет PNG графика рядом с forecasts.
+    """
+    try:
+        d = ART_DIR / fc_key
+        d.mkdir(parents=True, exist_ok=True)
+        p = _plot_path(fc_key)
+        with p.open("wb") as f:
+            f.write(png_bytes)
+    except Exception:
+        # логгер тут может быть ваш; оставлю без него, чтобы не ломать импорт
+        raise
+
+def load_plot(fc_key: str) -> Optional[bytes]:
+    """
+    Загружает PNG графика по ключу forecasts.
+    """
+    try:
+        p = _plot_path(fc_key)
+        if not p.exists():
+            return None
+        return p.read_bytes()
+    except Exception:
+        return None
+
+
 _startup_cleanup()
+

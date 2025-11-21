@@ -24,7 +24,6 @@ CRYPTO_MAP: Dict[str, str] = {
     "BTC":  "BTC-USD",
     "ETH":  "ETH-USD",
     "DOGE": "DOGE-USD",
-    "TON":  "TON-USD",
     "BNB":  "BNB-USD",
     "SOL":  "SOL-USD",
     "XRP":  "XRP-USD",

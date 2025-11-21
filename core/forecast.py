@@ -1,4 +1,11 @@
-"""forecast.py — пайплайн обучения моделей и построения 30-дневного прогноза."""
+"""
+forecast.py — пайплайн обучения моделей и построения 30-дневного прогноза.
+Содержит:
+- кэш моделей и прогнозов
+- мягкая санитизация прогноза
+- защита от "битых" кэшей (слишком плоских / упавших в lo / странных)
+- (опционально) кэш PNG графиков рядом с forecasts
+"""
 
 import hashlib
 import json
@@ -21,11 +28,12 @@ from .models import refit_and_forecast_30d, select_and_fit_with_candidates
 logger = logging.getLogger(__name__)
 models_logger = logging.getLogger("models")
 
-MODEL_VERSION = "v4"
+# ---- ВАЖНО: версия модели для кэша ----
+MODEL_VERSION = str(os.getenv("MODEL_VERSION", "v5")).strip()
+
 WF_HORIZON = int(os.getenv("WF_HORIZON", "5"))
 MODEL_CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "86400"))
 ENSEMBLES_ENABLED = os.getenv("ENSEMBLES_ENABLED", "1") == "1"
-
 
 # Куда складываем статистику по моделям
 STATS_PATH = (
@@ -64,6 +72,18 @@ def _make_data_signature(df: pd.DataFrame, tail_len: int = 256) -> str:
     ).hexdigest()
 
 
+def make_fc_key_and_sig(
+    df: pd.DataFrame, ticker: str
+) -> Tuple[str, str]:
+    """
+    Утилита для bot.py:
+    возвращает (fc_key, data_sig)
+    """
+    sig = _make_data_signature(df)
+    fc_key = model_cache.make_forecasts_key(ticker or "N/A", sig)
+    return fc_key, sig
+
+
 def _make_future_index(
     last_ts: pd.Timestamp, periods: int, ticker: str
 ) -> pd.DatetimeIndex:
@@ -77,18 +97,25 @@ def _make_future_index(
 
 
 # Жёсткость фильтра можно крутить из .env
-FC_MAX_MULT = float(os.getenv("FC_MAX_MULT", "5.0"))  # макс. ×5 от последней цены
-FC_MIN_MULT = float(os.getenv("FC_MIN_MULT", "0.2"))  # мин. ×0.2
+FC_MAX_MULT = float(os.getenv("FC_MAX_MULT", "5.0"))     # макс. ×5 от последней цены
+FC_MIN_MULT = float(os.getenv("FC_MIN_MULT", "0.2"))     # мин. ×0.2
 FC_MAX_DAILY_CHG = float(os.getenv("FC_MAX_DAILY_CHG", "0.5"))  # макс. дневной скачок 50%
+
+# дополнительная проверка первого шага относительно last_close
+FC_MAX_START_DEV = float(os.getenv("FC_MAX_START_DEV", "0.35"))  # 35% от last_close
+
+# порог "плоскости" прогноза
+FC_FLAT_PCT = float(os.getenv("FC_FLAT_PCT", "0.003"))  # 0.3% std/price
 
 
 def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> np.ndarray:
     """
     Мягкая санитизация прогноза:
     - заменяем NaN/inf на last_close
-    - убираем нули/отрицательные цены
+    - убираем нули/отрицательные цены (ставим нижнюю границу lo)
     - режем экстремальные уровни по FC_MIN_MULT / FC_MAX_MULT
     - МЯГКО ограничиваем дневной скачок по FC_MAX_DAILY_CHG
+
     НИКОГДА не возвращаем None, только откорректированный массив.
     """
     arr = np.asarray(arr, dtype=float)
@@ -96,7 +123,7 @@ def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> np.ndarray:
     if arr.size == 0:
         return arr
 
-    # 1) базовый уровень
+    # 1) базовый уровень last_close
     if not np.isfinite(last_close) or last_close <= 0:
         finite_pos = arr[np.isfinite(arr) & (arr > 0)]
         if finite_pos.size > 0:
@@ -107,30 +134,34 @@ def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> np.ndarray:
     # 2) NaN/inf → last_close
     arr = np.nan_to_num(arr, nan=last_close, posinf=last_close, neginf=last_close)
 
-    # 3) не даём нулевые/отрицательные цены
-    arr[arr <= 0] = last_close
-
-    # 4) мягкие границы по мультипликаторам
+    # 3) вычисляем границы ДО любых замен
     lo = last_close * FC_MIN_MULT
     hi = last_close * FC_MAX_MULT
+    if not np.isfinite(lo) or lo <= 0:
+        lo = max(last_close * 0.01, 1e-6)
+    if not np.isfinite(hi) or hi <= lo:
+        hi = last_close * 10.0
+
+    # 4) не даём нулевые/отрицательные цены
+    arr[arr <= 0] = lo
+
+    # 5) мягкие границы по мультипликаторам
     arr = np.clip(arr, lo, hi)
 
-    # 5) МЯГКИЙ лимит по дневному изменению
+    # 6) МЯГКИЙ лимит по дневному изменению
     if arr.size >= 2:
-        max_rel = FC_MAX_DAILY_CHG  # например, 0.5 = ±50% за день
+        max_rel = FC_MAX_DAILY_CHG
         for i in range(1, len(arr)):
             prev = arr[i - 1]
             if prev <= 0:
                 continue
             r = (arr[i] - prev) / prev
             if abs(r) > max_rel:
-                # обрезаем скачок до предельного
                 arr[i] = prev * (1.0 + np.sign(r) * max_rel)
 
-        # лог для диагностики
         rel = np.diff(arr) / arr[:-1]
         max_jump = float(np.max(np.abs(rel))) if rel.size > 0 else 0.0
-        if max_jump > max_rel * 0.9:  # почти у потолка
+        if max_jump > max_rel * 0.9:
             logger.warning(
                 "Forecast had big raw jumps, clipped to max |Δ|=%.2f (final max=%.2f)",
                 max_rel,
@@ -140,6 +171,49 @@ def _sanitize_forecast_array(arr: np.ndarray, last_close: float) -> np.ndarray:
     return arr
 
 
+def _is_too_flat(arr: np.ndarray, last_close: float, flat_pct: float = FC_FLAT_PCT) -> bool:
+    arr = np.asarray(arr, float)
+    if arr.size < 2:
+        return True
+    rel = float(np.std(arr) / max(last_close, 1e-9))
+    return rel < flat_pct
+
+
+def _forecast_sanity_ok(arr: np.ndarray, last_close: float) -> bool:
+    """
+    Более строгая проверка "нормальности" прогноза. Нужна, чтобы
+    не залипать на битом кэше после рестарта.
+    """
+    if arr is None:
+        return False
+    arr = np.asarray(arr, float)
+    if arr.size == 0:
+        return False
+    if not np.all(np.isfinite(arr)):
+        return False
+    if np.any(arr <= 0):
+        return False
+
+    lo = last_close * FC_MIN_MULT
+    hi = last_close * FC_MAX_MULT
+    lo = max(lo, 1e-9)
+
+    # 1) первый шаг не должен улетать далеко от last_close
+    dev0 = abs(arr[0] - last_close) / max(last_close, 1e-9)
+    if dev0 > FC_MAX_START_DEV:
+        return False
+
+    # 2) не должен почти весь лежать на lo или hi
+    frac_lo = float(np.mean(arr <= lo * 1.001))
+    frac_hi = float(np.mean(arr >= hi * 0.999))
+    if frac_lo > 0.6 or frac_hi > 0.6:
+        return False
+
+    # 3) не должен быть слишком плоским
+    if _is_too_flat(arr, last_close):
+        return False
+
+    return True
 
 
 # ---------- Ансамбли ----------
@@ -154,8 +228,6 @@ def _build_ensembles_from_candidates(
     Строим 2 ансамбля:
       - среднее по всем кандидатам
       - среднее по топ-3 по RMSE
-
-    Плюс sanity-check: выкидываем явных «поехавших» кандидатов.
     """
     last_close = float(y.iloc[-1])
     if not np.isfinite(last_close) or last_close == 0.0:
@@ -165,15 +237,9 @@ def _build_ensembles_from_candidates(
         try:
             s = refit_and_forecast_30d(y, cand)
             arr = s.values.astype(float)
-
             arr = _sanitize_forecast_array(arr, last_close)
-            if arr is None:
-                logger.warning(
-                    "Skip candidate %s: insane or invalid forecast",
-                    getattr(cand, "name", "?"),
-                )
+            if not _forecast_sanity_ok(arr, last_close):
                 return None
-
             return arr
         except Exception:
             logger.exception(
@@ -182,7 +248,7 @@ def _build_ensembles_from_candidates(
             )
             return None
 
-    # --- среднее по ВСЕМ кандидатам (после фильтрации) ---
+    # --- среднее по ВСЕМ кандидатам ---
     all_fcsts: List[np.ndarray] = []
     good_candidates = []
     for c in candidates:
@@ -228,7 +294,25 @@ def _is_fresh(meta: Dict[str, Any], ttl: int) -> bool:
     except Exception:
         return False
 
-# forecast.py
+
+def load_cached_plot_if_fresh(df: pd.DataFrame, ticker: str, ttl: Optional[int] = None) -> Optional[bytes]:
+    """
+    Достаёт PNG-байты из plot-cache, если forecasts свежие.
+    Используется в bot.py.
+    """
+    if ttl is None:
+        ttl = MODEL_CACHE_TTL_SECONDS
+
+    try:
+        fc_key, sig = make_fc_key_and_sig(df, ticker)
+        fb, fa, ft, meta = model_cache.load_forecasts(fc_key)
+        if meta is None or not _is_fresh(meta, ttl) or meta.get("data_sig") != sig:
+            return None
+        return model_cache.load_plot(fc_key)
+    except Exception:
+        logger.exception("load_cached_plot_if_fresh failed for %s", ticker)
+        return None
+
 
 def load_cached_forecasts_if_fresh(
     df: pd.DataFrame,
@@ -241,7 +325,7 @@ def load_cached_forecasts_if_fresh(
 
     Возвращает:
       (best_dict, metrics, fb, fa, ft)
-    или None, если кэш отсутствует / устарел / невалиден.
+    или None.
     """
     if not ticker:
         return None
@@ -258,13 +342,15 @@ def load_cached_forecasts_if_fresh(
         return None
 
     last_close = float(y.iloc[-1])
+
+    # санитизируем и проверяем sanity
     arr = fb["forecast"].values.astype(float)
     arr_ok = _sanitize_forecast_array(arr, last_close)
 
     if (
         _is_fresh(fmeta, ttl)
         and fmeta.get("data_sig") == data_sig
-        and arr_ok is not None
+        and _forecast_sanity_ok(arr_ok, last_close)
     ):
         logger.info("Forecasts cache HIT (fast path) for %s", ticker)
         models_logger.info(
@@ -283,7 +369,6 @@ def load_cached_forecasts_if_fresh(
 
     logger.info("Forecasts cache for %s is stale/insane → ignore", ticker)
     return None
-
 
 
 def _make_config_id(model_name: str, extra: Optional[dict]) -> str:
@@ -319,7 +404,6 @@ def _append_model_stats(
 
         rmse = metrics.get("rmse")
         mape = metrics.get("mape")
-
         config_id = _make_config_id(model_name, extra)
 
         row = {
@@ -362,7 +446,6 @@ def _append_model_stats(
 
 # ---------- Основной пайплайн ----------
 
-
 def train_select_and_forecast(
     df: pd.DataFrame,
     ticker: Optional[str] = None,
@@ -379,14 +462,13 @@ def train_select_and_forecast(
     val_steps = min(30, max(10, len(y) // 10))
     future_idx = _make_future_index(df.index[-1], 30, ticker or "")
 
-    # ---------- 1. Быстрый путь: пробуем взять ГОТОВЫЕ forecasts из кэша ----------
+    # ---------- 1. Fast path: forecasts cache ----------
     if ticker and not force_retrain:
         cached = load_cached_forecasts_if_fresh(df, ticker, MODEL_CACHE_TTL_SECONDS)
         if cached is not None:
-            # cached уже (best_dict, metrics, fb, fa, ft)
             return cached
 
-    # ---------- 2. Считаем сигнатуру и ключи кэша моделей/forecasts ----------
+    # ---------- 2. sig + keys ----------
     data_sig = _make_data_signature(df)
     params = {
         "val_steps": val_steps,
@@ -395,19 +477,7 @@ def train_select_and_forecast(
     model_key = model_cache.make_cache_key(ticker or "N/A", "auto", params, data_sig)
     fc_key = model_cache.make_forecasts_key(ticker or "N/A", data_sig)
 
-    try:
-        logger.debug(
-            "DSIG: ticker=%s len=%d last_dt=%s model_key=%s fc_key=%s",
-            ticker,
-            len(df),
-            pd.to_datetime(df.index[-1]).date().isoformat(),
-            model_key,
-            fc_key,
-        )
-    except Exception:
-        pass
-
-    # ---------- 3. Подготовка общих структур ----------
+    # ---------- 3. init ----------
     best_dict: Dict[str, Optional[str]] = {"name": None}
     metrics: Dict[str, Optional[float]] = {"rmse": None, "mape": None}
     fcst_best_df: Optional[pd.DataFrame] = None
@@ -433,10 +503,11 @@ def train_select_and_forecast(
             "model_version": MODEL_VERSION,
             "data_sig": data_sig,
             "ticker": (ticker or "N/A").upper(),
+            "fc_key": fc_key,  # чтобы /history мог найти PNG
         }
         model_cache.save_forecasts(fc_key, fb, fa, ft, meta)
 
-    # ---------- 4. Пытаемся использовать кэш МОДЕЛЕЙ (RF / SARIMAX / LSTM) ----------
+    # ---------- 4. Try cached MODELS ----------
 
     # --- sklearn (RandomForest) ---
     if ticker and not force_retrain:
@@ -456,24 +527,20 @@ def train_select_and_forecast(
 
                     preds_arr = np.array(preds, dtype=float)
                     sane = _sanitize_forecast_array(preds_arr, last_close)
-                    if sane is None:
-                        logger.warning(
-                            "Cached RF model produced insane forecast for %s — falling back to flat.",
-                            ticker,
+
+                    # sanity-check cached model forecast
+                    if _forecast_sanity_ok(sane, last_close):
+                        fcst_best_df = pd.DataFrame({"forecast": sane}, index=future_idx)
+                        best_dict["name"] = skl_meta.get("name", "cached_sklearn")
+                        metrics = skl_meta.get("metrics", {"rmse": None, "mape": None})
+                        models_logger.info(
+                            "Using cached SKLEARN model=%s for %s rmse=%.4f",
+                            best_dict["name"],
+                            (ticker or "N/A"),
+                            float(metrics.get("rmse") or float("nan")),
                         )
-                        sane = np.full(30, last_close, dtype=float)
-
-                    fcst_best_df = pd.DataFrame({"forecast": sane}, index=future_idx)
-
-                    best_dict["name"] = skl_meta.get("name", "cached_sklearn")
-                    metrics = skl_meta.get("metrics", {"rmse": None, "mape": None})
-                    models_logger.info(
-                        "Using cached SKLEARN model=%s for %s rmse=%.4f",
-                        best_dict["name"],
-                        (ticker or "N/A"),
-                        float(metrics.get("rmse") or float("nan")),
-                    )
-                    logger.info("Loaded cached sklearn model for %s", ticker)
+                    else:
+                        logger.warning("Cached RF forecast insane/flat -> ignore cache for %s", ticker)
             except Exception:
                 logger.exception("Error using cached sklearn model for %s", ticker)
 
@@ -484,23 +551,19 @@ def train_select_and_forecast(
             try:
                 fcst = sm_res.get_forecast(steps=30).predicted_mean.values
                 sane = _sanitize_forecast_array(fcst, last_close)
-                if sane is None:
-                    logger.warning(
-                        "Cached SARIMAX produced insane forecast for %s — falling back to flat.",
-                        ticker,
-                    )
-                    sane = np.full(30, last_close, dtype=float)
 
-                fcst_best_df = pd.DataFrame({"forecast": sane}, index=future_idx)
-                best_dict["name"] = sm_meta.get("name", "cached_sarimax")
-                metrics = sm_meta.get("metrics", {"rmse": None, "mape": None})
-                logger.info("Loaded cached SARIMAX model for %s", ticker)
-                models_logger.info(
-                    "Using cached SARIMAX model=%s for %s rmse=%.4f",
-                    best_dict["name"],
-                    (ticker or "N/A"),
-                    float(metrics.get("rmse") or float("nan")),
-                )
+                if _forecast_sanity_ok(sane, last_close):
+                    fcst_best_df = pd.DataFrame({"forecast": sane}, index=future_idx)
+                    best_dict["name"] = sm_meta.get("name", "cached_sarimax")
+                    metrics = sm_meta.get("metrics", {"rmse": None, "mape": None})
+                    models_logger.info(
+                        "Using cached SARIMAX model=%s for %s rmse=%.4f",
+                        best_dict["name"],
+                        (ticker or "N/A"),
+                        float(metrics.get("rmse") or float("nan")),
+                    )
+                else:
+                    logger.warning("Cached SARIMAX forecast insane/flat -> ignore cache for %s", ticker)
             except Exception:
                 logger.exception("Error using cached SARIMAX model for %s", ticker)
 
@@ -513,6 +576,10 @@ def train_select_and_forecast(
                 mu = float(extra["mu"])
                 sigma = float(extra["sigma"])
                 window = int(extra["window"])
+
+                # защита от sigma=0/NaN в старом кэше
+                if not np.isfinite(sigma) or sigma <= 1e-9:
+                    raise ValueError(f"Bad sigma in cached LSTM meta: {sigma}")
 
                 arr = y.values.astype("float32").reshape(-1, 1)
                 norm = (arr - mu) / sigma
@@ -528,27 +595,24 @@ def train_select_and_forecast(
 
                 preds_arr = np.array(preds, dtype=float)
                 sane = _sanitize_forecast_array(preds_arr, last_close)
-                if sane is None:
-                    logger.warning(
-                        "Cached LSTM model produced insane forecast for %s — falling back to flat.",
-                        ticker,
-                    )
-                    sane = np.full(30, last_close, dtype=float)
 
-                fcst_best_df = pd.DataFrame({"forecast": sane}, index=future_idx)
-                best_dict["name"] = tf_meta.get("name", "cached_lstm")
-                metrics = tf_meta.get("metrics", {"rmse": None, "mape": None})
-                models_logger.info(
-                    "Using cached LSTM model=%s for %s rmse=%.4f",
-                    best_dict["name"],
-                    (ticker or "N/A"),
-                    float(metrics.get("rmse") or float("nan")),
-                )
-                logger.info("Loaded cached LSTM model for %s", ticker)
+                if _forecast_sanity_ok(sane, last_close):
+                    fcst_best_df = pd.DataFrame({"forecast": sane}, index=future_idx)
+                    best_dict["name"] = tf_meta.get("name", "cached_lstm")
+                    metrics = tf_meta.get("metrics", {"rmse": None, "mape": None})
+                    models_logger.info(
+                        "Using cached LSTM model=%s for %s rmse=%.4f",
+                        best_dict["name"],
+                        (ticker or "N/A"),
+                        float(metrics.get("rmse") or float("nan")),
+                    )
+                else:
+                    logger.warning("Cached LSTM forecast insane/flat -> ignore cache for %s", ticker)
+
             except Exception:
                 logger.exception("Error using cached LSTM model for %s", ticker)
 
-    # ---------- 5. Если best уже есть (из кэша модели) – считаем/не считаем ансамбли, сохраняем три прогноза ----------
+    # ---------- 5. If best from cached model ----------
     if fcst_best_df is not None:
         if ENSEMBLES_ENABLED:
             _, candidates = select_and_fit_with_candidates(
@@ -576,15 +640,9 @@ def train_select_and_forecast(
             fcst_avg_all_df,
             fcst_avg_top3_df,
         )
-        models_logger.info(
-            "Using cached BEST model=%s for %s (fresh, ENSEMBLES_ENABLED=%s)",
-            best_dict.get("name") or "cached",
-            (ticker or "N/A"),
-            ENSEMBLES_ENABLED,
-        )
         return best_dict, metrics, fcst_best_df, fcst_avg_all_df, fcst_avg_top3_df
 
-    # ---------- 6. Обучение с нуля (нет ни прогнозов, ни пригодных кэш-моделей) ----------
+    # ---------- 6. Train from scratch ----------
     best, candidates = select_and_fit_with_candidates(
         y,
         val_steps=val_steps,
@@ -593,46 +651,24 @@ def train_select_and_forecast(
         save_plots=True,
     )
 
-    # Логи по всем кандидатам и победителю
-    try:
-        cand_lines = []
-        for c in candidates:
-            rmse_c = getattr(c, "rmse", None)
-            cand_lines.append(
-                f"{getattr(c, 'name', '?')}={rmse_c:.4f}"
-                if rmse_c is not None
-                else f"{getattr(c, 'name', '?')}=NA"
-            )
-
-        models_logger.info(
-            "Model candidates for %s: %s",
-            (ticker or "N/A"),
-            ", ".join(cand_lines),
-        )
-
-        best_rmse = getattr(best, "rmse", None)
-        models_logger.info(
-            "Winner model for %s: %s rmse=%.4f",
-            (ticker or "N/A"),
-            getattr(best, "name", "?"),
-            best_rmse if best_rmse is not None else float("nan"),
-        )
-    except Exception:
-        logger.exception("Failed to log model candidates for ticker=%s", ticker)
-
     # Прогноз лучшей модели
     raw_fcst_30 = refit_and_forecast_30d(y, best)
     last_close = float(y.iloc[-1])
 
     sanitized = _sanitize_forecast_array(raw_fcst_30.values, last_close)
-    if sanitized is None:
-        logger.warning(
-            "Winner model '%s' produced insane forecast for %s — falling back to flat.",
-            best.name,
-            ticker,
-        )
-        sanitized = np.full(30, last_close, dtype=float)
 
+    # fallback на 2-го кандидата, если winner слишком плоский
+    winner_used = best
+    if _is_too_flat(sanitized, last_close) and len(candidates) >= 2:
+        logger.warning("Forecast too flat -> fallback to 2nd best model")
+        second = sorted(candidates, key=lambda c: float(c.rmse))[1]
+        raw2 = refit_and_forecast_30d(y, second)
+        sanitized2 = _sanitize_forecast_array(raw2.values, last_close)
+        if _forecast_sanity_ok(sanitized2, last_close):
+            sanitized = sanitized2
+            winner_used = second
+
+    # IMPORTANT: y_fcst_30 создаём ВСЕГДА
     y_fcst_30 = pd.Series(sanitized, index=future_idx)
     fcst_best_df = pd.DataFrame({"forecast": y_fcst_30.values}, index=future_idx)
 
@@ -648,48 +684,48 @@ def train_select_and_forecast(
         fcst_avg_all_df = fcst_best_df.copy()
         fcst_avg_top3_df = fcst_best_df.copy()
 
-    # Метрики
+    # Метрики по winner_used
     rmse = mean_squared_error(
-        y.iloc[-val_steps:], best.yhat_val[-val_steps:], squared=False
+        y.iloc[-val_steps:], winner_used.yhat_val[-val_steps:], squared=False
     )
     try:
         mape = mean_absolute_percentage_error(
-            y.iloc[-val_steps:], best.yhat_val[-val_steps:]
+            y.iloc[-val_steps:], winner_used.yhat_val[-val_steps:]
         )
     except Exception:
         mape = np.nan
 
+    best_dict = {"name": winner_used.name}
+    metrics = {"rmse": float(rmse), "mape": float(mape) if mape == mape else None}
+
     models_logger.info(
         "Final WF metrics for %s: model=%s rmse=%.4f mape=%s",
         (ticker or "N/A"),
-        best.name,
+        winner_used.name,
         float(rmse),
         "NA" if mape != mape else f"{float(mape):.4f}",
     )
 
-    best_dict = {"name": best.name}
-    metrics = {"rmse": float(rmse), "mape": float(mape) if mape == mape else None}
-
-    # ---------- 7. Сохраняем модель-победителя и три прогноза ----------
+    # ---------- 7. Save winner model + forecasts ----------
     try:
         if ticker:
             meta_model = {
-                "name": best.name,
+                "name": winner_used.name,
                 "trained_at": int(time.time()),
                 "metrics": metrics,
-                "extra": getattr(best, "extra", {}),
+                "extra": getattr(winner_used, "extra", {}),
                 "model_version": MODEL_VERSION,
                 "data_sig": data_sig,
                 "ticker": (ticker or "N/A").upper(),
             }
 
-            if best.extra.get("type") == "rf":
-                rf_obj, lag = best.model_obj
+            if winner_used.extra.get("type") == "rf":
+                rf_obj, lag = winner_used.model_obj
                 meta_model["extra"] = {"lag": int(lag)}
                 model_cache.save_sklearn_model(model_key, rf_obj, meta_model)
 
-            elif best.extra.get("type") == "sarimax":
-                order, seas, trend, _ = best.model_obj
+            elif winner_used.extra.get("type") == "sarimax":
+                order, seas, trend, _ = winner_used.model_obj
                 m = sm.tsa.SARIMAX(
                     y,
                     order=order,
@@ -706,8 +742,8 @@ def train_select_and_forecast(
                 }
                 model_cache.save_statsmodels_result(model_key, res, meta_model)
 
-            elif best.extra.get("type") == "lstm":
-                mo = best.model_obj
+            elif winner_used.extra.get("type") == "lstm":
+                mo = winner_used.model_obj
                 if len(mo) == 4 and mo[-1] == "returns":
                     model, (mu, sigma), window, _ = mo
                 else:
@@ -720,7 +756,7 @@ def train_select_and_forecast(
                 model_cache.save_tf_model(model_key, model, meta_model)
 
             _save_three(
-                best.name,
+                winner_used.name,
                 metrics,
                 fcst_best_df,
                 fcst_avg_all_df,
@@ -730,16 +766,16 @@ def train_select_and_forecast(
     except Exception:
         logger.exception("Saving model/forecasts failed for %s", ticker)
 
-    # ---------- 8. Логируем статистику победившей модели ----------
+    # ---------- 8. Log stats ----------
     try:
         model_type = None
-        extra = getattr(best, "extra", None)
+        extra = getattr(winner_used, "extra", None)
         if isinstance(extra, dict):
             model_type = extra.get("type")
 
         _append_model_stats(
             ticker=ticker,
-            model_name=best.name,
+            model_name=winner_used.name,
             model_type=model_type,
             metrics=metrics,
             data_sig=data_sig,
