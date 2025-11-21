@@ -9,7 +9,11 @@ import logging
 import uuid
 import sys
 from datetime import date as _date
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+
+FORECAST_WORKERS = int(os.getenv("FORECAST_WORKERS", "2"))
+FORECAST_EXECUTOR = ThreadPoolExecutor(max_workers=FORECAST_WORKERS)
+
 
 import numpy as np
 from dotenv import load_dotenv
@@ -153,8 +157,6 @@ def _no_inflight() -> bool:
 
 warmup.set_inflight_checker(_no_inflight)
 
-FORECAST_WORKERS = int(os.getenv("FORECAST_WORKERS", "2"))
-FORECAST_EXECUTOR = ProcessPoolExecutor(max_workers=FORECAST_WORKERS)
 logger.info("Using FORECAST_WORKERS=%s", FORECAST_WORKERS)
 
 # --------------- Forecast pipeline ---------------
@@ -331,11 +333,16 @@ async def _get_shared_forecast(df, resolved_ticker: str):
     if owner:
         try:
             loop = asyncio.get_running_loop()
+
+            # можно форсить переобучение через env
+            force_retrain = os.getenv("FORCE_RETRAIN", "0") == "1"
+
             res = await loop.run_in_executor(
-                FORECAST_EXECUTOR,
-                train_select_and_forecast,
+                FORECAST_EXECUTOR,           # <-- твой executor
+                train_select_and_forecast,   # функция из core.forecast
                 df,
-                resolved_ticker,
+                resolved_ticker,             # <-- правильный тикер
+                force_retrain                # <-- определён
             )
             fut.set_result(res)
             return res
@@ -347,6 +354,7 @@ async def _get_shared_forecast(df, resolved_ticker: str):
                 INFLIGHT_FORECASTS.pop(sig, None)
     else:
         return await fut
+
 
 
 warmup.set_forecast_fn(_get_shared_forecast)

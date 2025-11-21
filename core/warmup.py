@@ -2,180 +2,292 @@
 import asyncio
 import logging
 import os
-import logging
-from datetime import datetime
+import random
+from contextlib import contextmanager
+from datetime import datetime, time as dt_time
+from typing import Awaitable, Callable, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("core.warmup")
 
+# -----------------------------------------------------------------------------
+# ENV
+# -----------------------------------------------------------------------------
+WARMUP_IDLE_SEC = int(os.getenv("WARMUP_IDLE_SEC", "10"))
 WARMUP_CHUNK = int(os.getenv("WARMUP_CHUNK", "5"))
+WARMUP_SHUFFLE = os.getenv("WARMUP_SHUFFLE", "1") == "1"
+WARMUP_PATTERN = os.getenv("WARMUP_PATTERN", "")
 
-def _interleave_chunks(crypto, stocks, forex, chunk_size: int = 5):
+# heavy window (локальное время)
+WARMUP_HEAVY_START = os.getenv("WARMUP_HEAVY_START", "01:00")
+WARMUP_HEAVY_END = os.getenv("WARMUP_HEAVY_END", "09:00")
+
+# лимит тикеров (0 = без лимита)
+WARMUP_LIMIT = int(os.getenv("WARMUP_LIMIT", "0"))
+
+# сколько секунд после пользовательской активности warmup не трогаем
+WARMUP_USER_IDLE_SEC = int(os.getenv("WARMUP_USER_IDLE_SEC", "20"))
+
+# -----------------------------------------------------------------------------
+# Backward compatible inflight-checker + activity API
+# -----------------------------------------------------------------------------
+_inflight_checker: Optional[Callable[[], bool]] = None
+_last_user_activity_ts: float = 0.0
+
+
+def set_inflight_checker(fn: Callable[[], bool]) -> None:
     """
-    Склеиваем списки кусками:
-    5 крипты, 5 акций, 5 форекс, снова 5 крипты, 5 акций, 5 форекс, ...
+    bot.py прокидывает сюда функцию, которая возвращает True,
+    если сейчас идёт важный forecast/запрос и warmup надо пропустить.
     """
-    res = []
-    i = j = k = 0
-    n_c, n_s, n_f = len(crypto), len(stocks), len(forex)
-
-    while i < n_c or j < n_s or k < n_f:
-        if i < n_c:
-            res.extend(crypto[i:i + chunk_size])
-            i += chunk_size
-        if j < n_s:
-            res.extend(stocks[j:j + chunk_size])
-            j += chunk_size
-        if k < n_f:
-            res.extend(forex[k:k + chunk_size])
-            k += chunk_size
-
-    # убираем дубликаты с сохранением порядка (на всякий случай)
-    seen = set()
-    out = []
-    for t in res:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-import time
-from typing import Awaitable, Callable, Optional
-
-from core.data import load_ticker_history, resolve_user_ticker
-
-logger = logging.getLogger(__name__)
-
-# --- конфиг из ENV ---
-IDLE_SEC_FOR_WARMUP = int(os.getenv("WARMUP_IDLE_SEC", "10"))      # сколько секунд тишины считаем "idle"
-WARMUP_INTERVAL_SEC = int(os.getenv("WARMUP_INTERVAL_SEC", "30"))  # только для информации, сам интервал задаём в bot.py
-
-# --- список тикеров, которые будем греть ---
-try:
-    from handlers_pro import SUPPORTED_TICKERS, SUPPORTED_CRYPTO, SUPPORTED_FOREX
-
-    WARMUP_TICKERS = _interleave_chunks(
-        list(SUPPORTED_CRYPTO),
-        list(SUPPORTED_TICKERS),
-        list(SUPPORTED_FOREX),
-        chunk_size=WARMUP_CHUNK,
-    )
-    logger.info(
-        "warmup: built WARMUP_TICKERS with pattern %d/%d/%d, total=%d",
-        min(WARMUP_CHUNK, len(SUPPORTED_CRYPTO)),
-        min(WARMUP_CHUNK, len(SUPPORTED_TICKERS)),
-        min(WARMUP_CHUNK, len(SUPPORTED_FOREX)),
-        len(WARMUP_TICKERS),
-    )
-except Exception:
-    logger.exception("warmup: failed to import SUPPORTED_* from handlers_pro, warmup list is empty")
-    WARMUP_TICKERS = []
-
-# --- состояние warmup-цикла ---
-WARMUP_INDEX = 0
-WARMUP_LOCK = asyncio.Lock()
-LAST_USER_ACTIVITY_TS = time.time()
-
-# сюда мы из bot.py подадим ссылку на _get_shared_forecast
-_forecast_fn: Optional[Callable[[object, str], Awaitable[object]]] = None
-
-WARMUP_CURRENT_TICKER: Optional[str] = None
-
-def get_current_ticker() -> Optional[str]:
-    """Для отладки: вернуть тикер, который сейчас тренируется warmup'ом (или None)."""
-    return WARMUP_CURRENT_TICKER
-
-_inflight_checker = None
-
-def set_inflight_checker(fn):
     global _inflight_checker
     _inflight_checker = fn
-
-def set_forecast_fn(fn: Callable[[object, str], Awaitable[object]]) -> None:
-    """
-    Регистрируем функцию, которая умеет считать прогноз:
-      async fn(df, resolved_ticker) -> (best, metrics, fb, fa, ft)
-    В bot.py мы сюда передадим _get_shared_forecast.
-    """
-    global _forecast_fn
-    _forecast_fn = fn
-    logger.info("warmup: forecast function registered: %s", getattr(fn, "__name__", str(fn)))
+    logger.info(
+        "warmup: inflight checker registered: %s",
+        getattr(fn, "__name__", str(fn))
+    )
 
 
 def mark_user_activity() -> None:
     """
-    Вызывай в /forecast и callback'ах, чтобы warmup знал,
-    что недавно были пользовательские запросы.
+    Backward compatible hook.
+    bot.py вызывает это при любом пользовательском действии
+    (forecast/callback), чтобы warmup не работал несколько секунд.
     """
-    global LAST_USER_ACTIVITY_TS
-    LAST_USER_ACTIVITY_TS = time.time()
+    global _last_user_activity_ts
+    _last_user_activity_ts = datetime.now().timestamp()
+    logger.debug("warmup: user activity marked at ts=%.0f", _last_user_activity_ts)
 
 
-async def warmup_one() -> None:
-    global WARMUP_INDEX, WARMUP_CURRENT_TICKER
+def _user_active_recently(now: Optional[datetime] = None) -> bool:
+    if WARMUP_USER_IDLE_SEC <= 0:
+        return False
+    now_ts = (now or datetime.now()).timestamp()
+    return (now_ts - _last_user_activity_ts) < WARMUP_USER_IDLE_SEC
 
+
+def _has_inflight() -> bool:
+    try:
+        if _inflight_checker is None:
+            return False
+        return bool(_inflight_checker())
+    except Exception:
+        return False
+
+
+# -----------------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------------
+def _parse_hhmm(s: str) -> dt_time:
+    try:
+        hh, mm = s.strip().split(":")
+        return dt_time(hour=int(hh), minute=int(mm))
+    except Exception:
+        return dt_time(1, 0)
+
+
+def _now_local() -> datetime:
+    return datetime.now()
+
+
+def _is_heavy_now(now: Optional[datetime] = None) -> bool:
+    now = now or _now_local()
+    start_t = _parse_hhmm(WARMUP_HEAVY_START)
+    end_t = _parse_hhmm(WARMUP_HEAVY_END)
+    cur_t = now.time()
+
+    if start_t <= end_t:
+        return start_t <= cur_t < end_t
+    return (cur_t >= start_t) or (cur_t < end_t)
+
+
+@contextmanager
+def _apply_night_overrides(enabled: bool):
+    """
+    enabled=True -> временно подменяем os.environ ключами NIGHT_*
+    """
+    if not enabled:
+        yield
+        return
+
+    backups = {}
+    try:
+        for k, v in os.environ.items():
+            if not k.startswith("NIGHT_"):
+                continue
+            base_key = k[len("NIGHT_"):]
+            backups[base_key] = os.environ.get(base_key)
+            os.environ[base_key] = v
+
+        logger.info("warmup: NIGHT overrides applied (%d keys)", len(backups))
+        yield
+    finally:
+        for base_key, old_val in backups.items():
+            if old_val is None:
+                os.environ.pop(base_key, None)
+            else:
+                os.environ[base_key] = old_val
+
+        logger.info("warmup: NIGHT overrides reverted")
+
+
+# -----------------------------------------------------------------------------
+# tickers source
+# -----------------------------------------------------------------------------
+def _tickers_from_env() -> List[str]:
+    raw = os.getenv("WARMUP_TICKERS", "").strip()
+    if not raw:
+        return []
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _load_tickers() -> List[str]:
+    tickers = _tickers_from_env()
+    if tickers:
+        return tickers
+    try:
+        from core.warmup_tickers import WARMUP_TICKERS  # type: ignore
+        return list(WARMUP_TICKERS)
+    except Exception:
+        return []
+
+
+# -----------------------------------------------------------------------------
+# public API
+# -----------------------------------------------------------------------------
+_forecast_fn: Optional[Callable[..., Awaitable[object]]] = None
+_warmup_lock = asyncio.Lock()
+
+
+def register_forecast_fn(fn: Callable[..., Awaitable[object]]) -> None:
+    global _forecast_fn
+    _forecast_fn = fn
+    logger.info(
+        "warmup: forecast function registered: %s",
+        getattr(fn, "__name__", str(fn))
+    )
+
+
+# backward compatible alias for bot.py
+def set_forecast_fn(fn: Callable[..., Awaitable[object]]) -> None:
+    register_forecast_fn(fn)
+
+
+async def warmup_models(context=None) -> None:
     if _forecast_fn is None:
+        logger.warning("warmup: no forecast fn registered; skipping")
         return
 
-    now = time.time()
-    if now - LAST_USER_ACTIVITY_TS < IDLE_SEC_FOR_WARMUP:
+    now = _now_local()
+
+    if _has_inflight():
+        logger.info("warmup: skipped due to inflight activity")
         return
 
-    if not WARMUP_TICKERS:
+    if _user_active_recently(now):
+        logger.info(
+            "warmup: skipped due to recent user activity (<%ds)",
+            WARMUP_USER_IDLE_SEC
+        )
         return
 
-    async with WARMUP_LOCK:
-        ticker = WARMUP_TICKERS[WARMUP_INDEX % len(WARMUP_TICKERS)]
-        WARMUP_INDEX += 1
+    if _warmup_lock.locked():
+        logger.warning("warmup: skipped because previous run still active")
+        return
+
+    async with _warmup_lock:
+        heavy = _is_heavy_now(now)
+        logger.info(
+            "warmup: start | heavy=%s | now=%s | window=%s-%s",
+            heavy,
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            WARMUP_HEAVY_START,
+            WARMUP_HEAVY_END,
+        )
+
+        with _apply_night_overrides(heavy):
+            await _warmup_impl(heavy=heavy)
+
+        logger.info("warmup: finished run")
+
+
+# ---- backward compatible entrypoint for scheduler ----
+async def warmup_job(context=None):
+    """
+    Старый entrypoint, который ожидает bot.py:
+      warmup.warmup_job
+    """
+    await warmup_models(context)
+
+
+async def _warmup_impl(heavy: bool) -> None:
+    tickers = _load_tickers()
+
+    if not tickers:
+        logger.warning("warmup: no tickers found. Nothing to do.")
+        return
+
+    if WARMUP_SHUFFLE:
+        random.shuffle(tickers)
+
+    if WARMUP_LIMIT > 0:
+        tickers = tickers[:WARMUP_LIMIT]
+
+    logger.info(
+        "warmup: tickers=%d chunk=%d idle=%ds heavy=%s",
+        len(tickers),
+        WARMUP_CHUNK,
+        WARMUP_IDLE_SEC,
+        heavy,
+    )
+
+    total_batches = (len(tickers) + WARMUP_CHUNK - 1) // WARMUP_CHUNK
+
+    for i in range(0, len(tickers), WARMUP_CHUNK):
+        batch_no = i // WARMUP_CHUNK + 1
+        batch = tickers[i:i + WARMUP_CHUNK]
+
+        logger.info(
+            "warmup: batch %d/%d -> %s",
+            batch_no,
+            total_batches,
+            ", ".join(batch)
+        )
+
+        results = await asyncio.gather(
+            *(warmup_one(t) for t in batch),
+            return_exceptions=True
+        )
+
+        for tck, res in zip(batch, results):
+            if isinstance(res, Exception):
+                logger.error("warmup: batch error for %s: %r", tck, res)
+
+        await asyncio.sleep(WARMUP_IDLE_SEC)
+
+
+async def warmup_one(user_ticker: str) -> None:
+    try:
+        from core.data import load_ticker_history
+    except Exception:
+        logger.exception("warmup: cannot import load_ticker_history")
+        return
 
     try:
-        resolved = resolve_user_ticker(ticker)
+        df, resolved = await load_ticker_history(user_ticker)
+    except TypeError:
+        try:
+            df, resolved = load_ticker_history(user_ticker)
+        except Exception:
+            logger.exception("warmup: load_ticker_history failed for %s", user_ticker)
+            return
     except Exception:
-        resolved = ticker
-
-    df = load_ticker_history(resolved)
-    if df is None or df.empty:
-        logger.warning("warmup: no data for ticker=%s (resolved=%s)", ticker, resolved)
+        logger.exception("warmup: load_ticker_history failed for %s", user_ticker)
         return
 
-    # 👇 тут фиксируем, что именно сейчас считаем
-    WARMUP_CURRENT_TICKER = resolved
     logger.info("warmup: start training %s", resolved)
 
     try:
-        await _forecast_fn(df, resolved)
-        logger.info("warmup: finished training %s", resolved)
+        await _forecast_fn(df, resolved)  # type: ignore
+        logger.info("warmup: done for %s", resolved)
     except Exception:
         logger.exception("warmup: failed for %s", resolved)
-    finally:
-        # по-любому очищаем
-        WARMUP_CURRENT_TICKER = None
-
-    
-
-
-async def warmup_job(context) -> None:
-    """
-    Обёртка для JobQueue (подпись (context) обязательна).
-    """
-    await warmup_one()
-
-def get_debug_info(max_tickers: int = 30) -> dict:
-    """
-    Возвращает диагностическую информацию о warmup-цикле
-    для /debug_warmup.
-    """
-    try:
-        last_iso = datetime.fromtimestamp(LAST_USER_ACTIVITY_TS).isoformat()
-    except Exception:
-        last_iso = f"{LAST_USER_ACTIVITY_TS}"
-
-    return {
-        "idle_sec_for_warmup": IDLE_SEC_FOR_WARMUP,
-        "interval_sec": WARMUP_INTERVAL_SEC,
-        "last_user_activity_ts": LAST_USER_ACTIVITY_TS,
-        "last_user_activity_iso": last_iso,
-        "current_ticker": WARMUP_CURRENT_TICKER,
-        "index": WARMUP_INDEX,
-        "total_tickers": len(WARMUP_TICKERS),
-        "tickers_preview": WARMUP_TICKERS[:max_tickers],
-    }
