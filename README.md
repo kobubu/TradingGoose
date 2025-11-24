@@ -17,17 +17,29 @@ time series analysis.
 1.  Clone the repository:
 
 ``` bash
-git clone https://github.com/kobubu/YourTradeBot.git
-cd YourTradeBot
+git clone https://github.com/kobubu/TradingGoose
+cd TradingGoose
 ```
 
-2.  Install dependencies:
+2. Create virtual environment
+
+```
+python -m venv .venv
+
+# Activate on Windows:
+.venv\Scripts\activate
+
+# Activate on macOS/Linux:
+source .venv/bin/activate
+```
+
+3.  Install dependencies:
 
 ``` bash
 pip install -r requirements.txt
 ```
 
-3.  Configure environment variables:
+4.  Configure environment variables:
 
 ``` bash
 cp .env.example .env
@@ -35,7 +47,7 @@ cp .env.example .env
 
 Edit `.env` with your API keys.
 
-4.  Run the bot:
+5.  Run the bot:
 
 ``` bash
 python main.py
