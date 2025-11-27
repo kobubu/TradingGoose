@@ -50,7 +50,7 @@ Edit `.env` with your API keys.
 5.  Run the bot:
 
 ``` bash
-python main.py
+python bot.py
 ```
 
 ## ⚙️ Configuration
